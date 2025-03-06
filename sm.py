@@ -179,7 +179,7 @@ def usage(wrong_config=False, wrong_command=False, wrong_arg_len=False):
 
 
 def consume_args():
-    if len(argv) < 1 or argv[1] != "send":
+    if len(argv) < 2 or argv[1] != "send":
         return None
     allowed_opts = ["recipient", "subject", "body", "file"]
     mandatory_opts = ["recipient", "subject", "body"]
