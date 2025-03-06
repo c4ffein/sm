@@ -155,7 +155,7 @@ def usage(wrong_config=False, wrong_command=False, wrong_arg_len=False):
     output_lines = [
         "sm - Simple Mail client",
         "=======================",
-        """~/.config/sm/init.json => {"accounts": [ACCOUNT_INFOS, ACCOUNT_INFOS, ...]}"""
+        """~/.config/sm/init.json => {"accounts": [ACCOUNT_INFOS, ACCOUNT_INFOS, ...]}""",
         "  - ACCOUNT_INFOS = {",
         "    \"name\": \"XX\"",
         "    \"imap_ssl_host\": \"XX\"",
