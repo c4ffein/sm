@@ -10,13 +10,13 @@ TODO Linter in CI
 """
 
 import os
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
 from email import encoders
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from enum import Enum
-from json import loads
 from hashlib import sha256
+from json import loads
 from pathlib import Path
 from smtplib import SMTP, SMTPAuthenticationError
 from ssl import (
@@ -31,8 +31,11 @@ from ssl import (
     _ASN1Object,
     _ssl,
 )
-from sys import argv, flags as sys_flags
+from sys import argv
+from sys import flags as sys_flags
 
+CONFIG_PATH = Path.home() / ".config" / "sm" / "config.json"
+LOCK_PATH = Path.home() / ".config" / "sm" / ".lock"
 
 colors = {"RED": "31", "GREEN": "32", "PURP": "34", "DIM": "90", "WHITE": "39"}
 Color = Enum("Color", [(k, f"\033[{v}m") for k, v in colors.items()])
@@ -88,6 +91,34 @@ class SMException(Exception):
     pass
 
 
+def acquire_lock():
+    try:
+        with LOCK_PATH.open("x"):
+            pass
+    except FileExistsError:
+        raise SMException(
+            f"Failed to acquire lock.\nIf no instance of the tool is running, you may remove: {LOCK_PATH}"
+        ) from None
+
+
+def release_lock():
+    LOCK_PATH.unlink()
+
+
+def locked(func):
+    def wrapper(*args, **kwargs):
+        acquire_lock(LOCK_PATH)
+        try:
+            r = func(*args, **kwargs)
+        except SMException as exc:
+            release_lock(LOCK_PATH)
+            raise exc
+        release_lock(LOCK_PATH)
+        return r
+
+    return wrapper
+
+
 class MailConnectionInfos:
     KWARGS = {
         "name": None,
@@ -101,6 +132,7 @@ class MailConnectionInfos:
         "password": None,
         "local_store_path": None,
     }
+
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
             if k not in self.KWARGS:
@@ -117,19 +149,19 @@ def send_email(account_config, recipient_email, subject, body, attachment_paths=
     if attachment_paths:
         for file_path in attachment_paths:
             try:
-                with open(file_path, "rb") as attachment:
+                with Path(file_path).open("rb") as attachment:
                     part = MIMEBase("application", "octet-stream")
                     part.set_payload(attachment.read())
                 encoders.encode_base64(part)
-                filename = os.path.basename(file_path)
+                filename = Path(file_path).name
                 part.add_header("Content-Disposition", f"attachment; filename= {filename}")
                 message.attach(part)
-                
+
             except Exception as e:
                 raise SMException(f"Error attaching file {file_path}: {str(e)}") from e
 
     try:
-        ssl_context=make_pinned_ssl_context(account_config.pinned_smtp_certificate_sha256)
+        ssl_context = make_pinned_ssl_context(account_config.pinned_smtp_certificate_sha256)
     except Exception as e:
         raise SMException(f"Verified TLS Error: {e}") from e
 
@@ -147,7 +179,7 @@ def send_email(account_config, recipient_email, subject, body, attachment_paths=
     finally:
         try:
             server.quit()
-        except:
+        except Exception:
             pass
 
 
@@ -157,20 +189,19 @@ def usage(wrong_config=False, wrong_command=False, wrong_arg_len=False):
         "=======================",
         """~/.config/sm/init.json => {"accounts": [ACCOUNT_INFOS, ACCOUNT_INFOS, ...]}""",
         "  - ACCOUNT_INFOS = {",
-        "    \"name\": \"XX\"",
-        "    \"imap_ssl_host\": \"XX\"",
-        "    \"imap_ssl_port\": 993",
-        "    \"username\": \"XX\"",
-        "    \"password\": \"XX\"",
-        "    \"pinned_imap_certificate_sha256\": \"XX\"",
-        "    \"smtp_ssl_host\": \"XX\"",
-        "    \"smtp_ssl_port\": 587",
-        "    \"pinned_smtp_certificate_sha256\": \"XX\"",
-        "    \"local_store_path\": \"XX\""
-        "=======================",
+        '    "name": "XX"',
+        '    "imap_ssl_host": "XX"',
+        '    "imap_ssl_port": 993',
+        '    "username": "XX"',
+        '    "password": "XX"',
+        '    "pinned_imap_certificate_sha256": "XX"',
+        '    "smtp_ssl_host": "XX"',
+        '    "smtp_ssl_port": 587',
+        '    "pinned_smtp_certificate_sha256": "XX"',
+        '    "local_store_path": "XX"' "=======================",
         "- sm send recipient=c4ffein@gmail.com subject=title body=something file=/optional/path ==> send a mail",
         "=======================",
-        "You need to generate an app specific password for gmail or other mail clients" 
+        "You need to generate an app specific password for gmail or other mail clients",
     ]
     red_indexes = (list(range(2, 14)) if wrong_config else []) + ([15] if wrong_command or wrong_arg_len else [])
     output_lines = [f"\033[93m{line}\033[0m" if i in red_indexes else line for i, line in enumerate(output_lines)]
@@ -186,11 +217,11 @@ def consume_args():
     invalid_options = [v for v in argv[2:] if all(not v.startswith(f"{o}=") for o in allowed_opts)]
     if invalid_options:
         raise SMException(f"Invalid options for send: {'  ;  '.join(invalid_options)}")
-    opts = {v[:v.index("=")]: v[v.index("=")+1:] for v in argv[2:] if not v.startswith("file=")}
+    opts = {v[: v.index("=")]: v[v.index("=") + 1 :] for v in argv[2:] if not v.startswith("file=")}
     missing_options = [v for v in mandatory_opts if v not in opts]
     if missing_options:
         raise SMException(f"Missing options for send: {'  ;  '.join(missing_options)}")
-    opts["files"] = [v[v.index("=")+1:] for v in argv[2:] if v.startswith("file=")]
+    opts["files"] = [v[v.index("=") + 1 :] for v in argv[2:] if v.startswith("file=")]
     return opts
 
 
