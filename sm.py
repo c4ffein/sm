@@ -107,13 +107,13 @@ def release_lock():
 
 def locked(func):
     def wrapper(*args, **kwargs):
-        acquire_lock(LOCK_PATH)
+        acquire_lock()
         try:
             r = func(*args, **kwargs)
         except SMException as exc:
-            release_lock(LOCK_PATH)
+            release_lock()
             raise exc
-        release_lock(LOCK_PATH)
+        release_lock()
         return r
 
     return wrapper
