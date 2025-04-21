@@ -33,12 +33,15 @@ from ssl import (
 )
 from sys import argv
 from sys import flags as sys_flags
+from uuid import uuid4
 
 CONFIG_PATH = Path.home() / ".config" / "sm" / "config.json"
 LOCK_PATH = Path.home() / ".config" / "sm" / ".lock"
 
 colors = {"RED": "31", "GREEN": "32", "PURP": "34", "DIM": "90", "WHITE": "39"}
 Color = Enum("Color", [(k, f"\033[{v}m") for k, v in colors.items()])
+
+ALLOWED_NAME_CHARS = "qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM0123456789.-_"
 
 
 def make_pinned_ssl_context(pinned_sha_256):
@@ -138,6 +141,28 @@ class MailConnectionInfos:
             if k not in self.KWARGS:
                 raise SMException(f"Wrong argument for account in config: {k}")
             setattr(self, k, v)
+
+
+@locked
+def save_attachment(store_path: Path, msg):
+    for file_name in ["index", "files", "mails"]:
+        (Path(store_path) / file_name).mkdir(mode=0o700, parents=True, exist_ok=True)
+    returned_paths = []
+    att_path = "No attachment found."
+    for part in msg.walk():
+        if (part.get_content_maintype() == "multipart") or (part.get("Content-Disposition") is None):
+            continue
+        filename = part.get_filename() or "UNKNOWN"
+        filename = "".join(c for c in filename.lower().replace(" ", "_") if c in ALLOWED_NAME_CHARS)
+        filename = "".join(str(uuid4()).split("-")[:3]) + "-" + filename
+        att_path = store_path / "files" / filename
+        if not att_path.is_file():
+            content = part.get_payload(decode=True)
+            if not content:
+                continue
+            with att_path.open("wb") as fp:
+                fp.write(content)
+        returned_paths.append(att_path)
 
 
 def send_email(account_config, recipient_email, subject, body, attachment_paths=None):
