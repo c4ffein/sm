@@ -240,6 +240,8 @@ def consume_args():
     if len(argv) < 2 or argv[1] not in ["send", "backup"]:
         return None
     if argv[1] == "backup":
+        if len(argv) < 2:
+            return None
         return {"action": "backup"}
     allowed_opts = ["recipient", "subject", "body", "file"]
     mandatory_opts = ["recipient", "subject", "body"]
