@@ -223,8 +223,10 @@ def usage(wrong_config=False, wrong_command=False, wrong_arg_len=False):
         '    "smtp_ssl_host": "XX"',
         '    "smtp_ssl_port": 587',
         '    "pinned_smtp_certificate_sha256": "XX"',
-        '    "local_store_path": "XX"' "=======================",
+        '    "local_store_path": "XX"',
+        "=======================",
         "- sm send recipient=c4ffein@gmail.com subject=title body=something file=/optional/path ==> send a mail",
+        "- sm backup                                                                            ==> backup everything",
         "=======================",
         "You need to generate an app specific password for gmail or other mail clients",
     ]
@@ -235,8 +237,10 @@ def usage(wrong_config=False, wrong_command=False, wrong_arg_len=False):
 
 
 def consume_args():
-    if len(argv) < 2 or argv[1] != "send":
+    if len(argv) < 2 or argv[1] not in ["send", "backup"]:
         return None
+    if argv[1] == "backup":
+        return {"action": "backup"}
     allowed_opts = ["recipient", "subject", "body", "file"]
     mandatory_opts = ["recipient", "subject", "body"]
     invalid_options = [v for v in argv[2:] if all(not v.startswith(f"{o}=") for o in allowed_opts)]
@@ -247,7 +251,7 @@ def consume_args():
     if missing_options:
         raise SMException(f"Missing options for send: {'  ;  '.join(missing_options)}")
     opts["files"] = [v[v.index("=") + 1 :] for v in argv[2:] if v.startswith("file=")]
-    return opts
+    return {**opts, "action": "send"}
 
 
 def main():
@@ -270,8 +274,12 @@ def main():
     args = consume_args()
     if not args:
         return usage()
-    send_email(selected_account, args["recipient"], args["subject"], args["body"], args["files"])
-    return
+    if args["action"] == "send":
+        send_email(selected_account, args["recipient"], args["subject"], args["body"], args["files"])
+    elif args["action"] == "backup":
+        raise NotImplementedError  # TODO
+    else:
+        return usage()
 
 
 if __name__ == "__main__":
