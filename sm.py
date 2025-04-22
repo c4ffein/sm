@@ -256,7 +256,7 @@ def consume_args():
 
 def main():
     try:
-        with (Path.home() / ".config" / "sm" / "config.json").open() as f:
+        with CONFIG_PATH.open() as f:
             config = loads(f.read())
     except Exception:
         return usage(wrong_config=True)
