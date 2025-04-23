@@ -10,12 +10,14 @@ TODO Linter in CI
 """
 
 import os
-from email import encoders
+from email import encoders, message_from_bytes
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from enum import Enum
 from hashlib import sha256
+from imaplib import IMAP4_SSL
+from itertools import chain
 from json import loads
 from pathlib import Path
 from smtplib import SMTP, SMTPAuthenticationError
@@ -165,6 +167,48 @@ def save_attachment(store_path: Path, msg):
         returned_paths.append(att_path)
 
 
+def search_uid_string(uid_max, criteria):
+    c = list((t0, f"\"{t1}\"") for t0, t1 in criteria.items()) + [("UID", f"{uid_max+1}:*")]
+    return f"({' '.join(chain(*c))})"
+
+
+def quick_and_dirty_backup(config):
+    # TODO Better login/logout, gracefully fail for any error
+    criteria = {}
+    uid_max = 0
+    connection_infos = MailConnectionInfos(**config["accounts"][1])  # TODO Parameterize 1, reuse parameter
+    ssl_context = make_pinned_ssl_context(connection_infos.pinned_imap_certificate_sha256)
+    mail = IMAP4_SSL(connection_infos.imap_ssl_host, connection_infos.imap_ssl_port, ssl_context=ssl_context)
+    mail.login(connection_infos.username, connection_infos.password)
+    status, messages = mail.select("inbox")  # TODO Operate on all folders
+    result, data = mail.uid("SEARCH", None, search_uid_string(uid_max, criteria))
+    uids = [int(s) for s in data[0].split()]
+    print(uids)  # TODO Aggregate and log
+    if uids:
+        uid_max = max(uids)
+
+    for xii, uid in enumerate(uids):
+        # TODO Here in case the server isn't following UID norms
+        if uid > uid_max or True:  # TODO Make a more comprehensive check before working with uids better?
+            # TODO If we can ensure we can work with uid, don't get those that we already backed up
+            # TODO Handle the deletion of an email by keeping it here but marking it as deleted
+            # TODO Handle the move of an email, check first no confusion with deletion
+            # TODO - if deletion detected, mark for check, once all inboxes obtained again, mark moved or deleted?
+            print(f"\n\n{uid}\n\n")  # TODO Aggregate and log
+            result, data = mail.uid("fetch", str(uid), "(RFC822)")
+            for response_part in data:
+                if isinstance(response_part, tuple):
+                    # TODO work on message_from_bytes or message_from_strings
+                    # TODO save the message as binary and index in an easily consumable way
+                    email_identifier = response_part[0]
+                    email_data = message_from_bytes(response_part[1])
+                    save_attachment(Path(config["accounts"][1]["local_store_path"]), email_data)  # TODO Parameterize 1
+                    print(response_part[1], email_data.get_payload())  # TODO Better than naive print
+                    # TODO Handle save_at in response_part[1] to compute file name instead?
+            uid_max = uid
+    mail.logout()
+
+
 def send_email(account_config, recipient_email, subject, body, attachment_paths=None):
     sender_email = account_config.username
     message = MIMEMultipart()
@@ -279,7 +323,7 @@ def main():
     if args["action"] == "send":
         send_email(selected_account, args["recipient"], args["subject"], args["body"], args["files"])
     elif args["action"] == "backup":
-        raise NotImplementedError  # TODO
+        quick_and_dirty_backup(config)  # TODO Better implem obviously
     else:
         return usage()
 
