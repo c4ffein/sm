@@ -331,6 +331,9 @@ def main():
 if __name__ == "__main__":
     try:
         exit(main())
+    except KeyboardInterrupt:
+        print("\n  !!  KeyboardInterrupt received  !!  \n")
+        exit(-2)
     except SMException as e:
         print(f"{Color.RED.value}\n  !!  {e}  !!  \n")
         exit(-1)
