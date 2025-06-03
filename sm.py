@@ -21,6 +21,8 @@ from itertools import chain
 from json import loads
 from pathlib import Path
 from smtplib import SMTP, SMTPAuthenticationError
+from socket import gaierror
+from socket import timeout as socket_timeout
 from ssl import (
     CERT_NONE,
     CERT_REQUIRED,
@@ -35,6 +37,7 @@ from ssl import (
 )
 from sys import argv
 from sys import flags as sys_flags
+from urllib.error import HTTPError
 from uuid import uuid4
 
 CONFIG_PATH = Path.home() / ".config" / "sm" / "config.json"
@@ -94,6 +97,27 @@ def make_pinned_ssl_context(pinned_sha_256):
 
 class SMException(Exception):
     pass
+
+
+def raise_smexception_on_connection_error(func):
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except HTTPError as exc:
+            raise SMException(f"HTTP Error when reaching server: {exc.code}") from exc
+        except socket_timeout as exc:
+            raise SMException("Timed out") from exc
+        except Exception as exc:
+            if isinstance(getattr(exc, "reason", None), socket_timeout):
+                raise SMException("TLS timed out") from exc  # Most probable cause, should check this is always the case
+            if isinstance(getattr(exc, "reason", None), gaierror):
+                raise SMException("Failed domain name resolution") from exc
+            if isinstance(getattr(exc, "reason", None), SSLCertVerificationError):
+                raise SMException("Failed SSL cert validation") from exc
+            # Keeping this as-is for now, should not happen if everything is handled correctly, add any necessary ones
+            raise SMException("Unknown error when trying to reach server") from exc
+
+    return wrapper
 
 
 def acquire_lock():
@@ -172,6 +196,7 @@ def search_uid_string(uid_max, criteria):
     return f"({' '.join(chain(*c))})"
 
 
+@raise_smexception_on_connection_error
 def quick_and_dirty_backup(config):
     # TODO Better login/logout, gracefully fail for any error
     criteria = {}
@@ -209,6 +234,7 @@ def quick_and_dirty_backup(config):
     mail.logout()
 
 
+@raise_smexception_on_connection_error
 def send_email(account_config, recipient_email, subject, body, attachment_paths=None):
     sender_email = account_config.username
     message = MIMEMultipart()
