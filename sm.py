@@ -281,8 +281,8 @@ def send_email(account_config, recipient_email, subject, body, attachment_paths=
 def usage(wrong_config=False, wrong_command=False, wrong_arg_len=False):
     output_lines = [
         "sm - Simple Mail client",
-        "=======================",
-        """~/.config/sm/init.json => {"accounts": [ACCOUNT_INFOS, ACCOUNT_INFOS, ...]}""",
+        "───────────────────────",
+        """~/.config/sm/init.json ──➤ {"accounts": [ACCOUNT_INFOS, ACCOUNT_INFOS, ...]}""",
         "  - ACCOUNT_INFOS = {",
         '    "name": "XX"',
         '    "imap_ssl_host": "XX"',
@@ -294,10 +294,10 @@ def usage(wrong_config=False, wrong_command=False, wrong_arg_len=False):
         '    "smtp_ssl_port": 587',
         '    "pinned_smtp_certificate_sha256": "XX"',
         '    "local_store_path": "XX"',
-        "=======================",
-        "- sm send recipient=c4ffein@gmail.com subject=title body=something file=/optional/path ==> send a mail",
-        "- sm backup                                                                            ==> backup everything",
-        "=======================",
+        "───────────────────────",
+        "- sm send recipient=c4ffein@gmail.com subject=title body=something file=/optional/path ──➤ send a mail",
+        "- sm backup                                                                            ──➤ backup everything",
+        "───────────────────────",
         "You need to generate an app specific password for gmail or other mail clients",
     ]
     red_indexes = (list(range(2, 14)) if wrong_config else []) + ([15] if wrong_command or wrong_arg_len else [])
