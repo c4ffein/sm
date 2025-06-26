@@ -108,11 +108,15 @@ def raise_smexception_on_connection_error(func):
         except socket_timeout as exc:
             raise SMException("Timed out") from exc
         except Exception as exc:
+            if isinstance(exc, SMException):
+                raise exc
             if isinstance(getattr(exc, "reason", None), socket_timeout):
                 raise SMException("TLS timed out") from exc  # Most probable cause, should check this is always the case
             if isinstance(getattr(exc, "reason", None), gaierror):
                 raise SMException("Failed domain name resolution") from exc
             if isinstance(getattr(exc, "reason", None), SSLCertVerificationError):
+                raise SMException("Failed SSL cert validation") from exc
+            if isinstance(exc, SSLCertVerificationError):
                 raise SMException("Failed SSL cert validation") from exc
             # Keeping this as-is for now, should not happen if everything is handled correctly, add any necessary ones
             raise SMException("Unknown error when trying to reach server") from exc
@@ -270,7 +274,7 @@ def send_email(account_config, recipient_email, subject, body, attachment_paths=
     except SMTPAuthenticationError as exc:
         raise SMException(f"Auth error:\n{str(exc)}") from exc
     except Exception as exc:
-        raise SMException(f"Error sending email:\n{str(exc)}") from exc
+        raise SMException(f"Error sending email: {str(exc)}") from exc
     finally:
         try:
             server.quit()
