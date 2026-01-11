@@ -1,3 +1,17 @@
+.PHONY: help lint lint-check test install-build-system build-package install-package-uploader upload-package-test upload-package
+
+help:
+	@echo "sm - Makefile commands"
+	@echo "────────────────────────────────────"
+	@echo "  make lint              - Fix linting issues with ruff"
+	@echo "  make lint-check        - Check linting without fixing"
+	@echo "  make test              - Run tests"
+	@echo "  make install-build-system   - Install build tools"
+	@echo "  make build-package     - Build source distribution"
+	@echo "  make install-package-uploader - Install twine for uploading"
+	@echo "  make upload-package-test - Upload to TestPyPI"
+	@echo "  make upload-package    - Upload to PyPI"
+
 lint:
 	ruff check --fix; ruff format
 

@@ -6,7 +6,6 @@ MIT License - Copyright (c) 2025 c4ffein
 WARNING: I don't recommand using this as-is. This a PoC, and usable by me because I know what I want to do with it.
 - You can use it if you feel that you can edit the code yourself and you can live with my future breaking changes.
 TODOs and possible improvements: Fill this
-TODO Linter in CI
 """
 
 import os
@@ -196,7 +195,7 @@ def save_attachment(store_path: Path, msg):
 
 
 def search_uid_string(uid_max, criteria):
-    c = list((t0, f"\"{t1}\"") for t0, t1 in criteria.items()) + [("UID", f"{uid_max+1}:*")]
+    c = [(t0, f'"{t1}"') for t0, t1 in criteria.items()] + [("UID", f"{uid_max + 1}:*")]
     return f"({' '.join(chain(*c))})"
 
 
@@ -216,7 +215,7 @@ def quick_and_dirty_backup(config):
     if uids:
         uid_max = max(uids)
 
-    for xii, uid in enumerate(uids):
+    for _xii, uid in enumerate(uids):
         # TODO Here in case the server isn't following UID norms
         if uid > uid_max or True:  # TODO Make a more comprehensive check before working with uids better?
             # TODO If we can ensure we can work with uid, don't get those that we already backed up
@@ -229,7 +228,7 @@ def quick_and_dirty_backup(config):
                 if isinstance(response_part, tuple):
                     # TODO work on message_from_bytes or message_from_strings
                     # TODO save the message as binary and index in an easily consumable way
-                    email_identifier = response_part[0]
+                    # response_part[0] is email_identifier
                     email_data = message_from_bytes(response_part[1])
                     save_attachment(Path(config["accounts"][1]["local_store_path"]), email_data)  # TODO Parameterize 1
                     print(response_part[1], email_data.get_payload())  # TODO Better than naive print
