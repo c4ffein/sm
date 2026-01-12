@@ -9,11 +9,11 @@ TODOs and possible improvements: Fill this
 """
 
 import os
+from dataclasses import dataclass, fields
 from email import encoders, message_from_bytes
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from dataclasses import dataclass, fields
 from enum import Enum
 from hashlib import sha256
 from imaplib import IMAP4_SSL
@@ -322,7 +322,8 @@ def consume_args():
     invalid_options = [v for v in argv[2:] if all(not v.startswith(f"{o}=") for o in allowed_opts)]
     if invalid_options:
         raise SMException(f"Invalid options for send: {'  ;  '.join(invalid_options)}")
-    opts = {v[: v.index("=")]: v[v.index("=") + 1 :] for v in argv[2:] if v.startswith(("recipient=", "subject=", "body=", "account="))}
+    single_opts = ("recipient=", "subject=", "body=", "account=")
+    opts = {v[: v.index("=")]: v[v.index("=") + 1 :] for v in argv[2:] if v.startswith(single_opts)}
     missing_options = [v for v in mandatory_opts if v not in opts]
     if missing_options:
         raise SMException(f"Missing options for send: {'  ;  '.join(missing_options)}")
