@@ -13,6 +13,7 @@ from email import encoders, message_from_bytes
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from dataclasses import dataclass, fields
 from enum import Enum
 from hashlib import sha256
 from imaplib import IMAP4_SSL
@@ -148,25 +149,26 @@ def locked(func):
     return wrapper
 
 
+@dataclass
 class MailConnectionInfos:
-    KWARGS = {
-        "name": None,
-        "imap_ssl_host": None,
-        "imap_ssl_port": None,
-        "pinned_imap_certificate_sha256": None,
-        "smtp_ssl_host": None,
-        "smtp_ssl_port": None,
-        "pinned_smtp_certificate_sha256": None,
-        "username": None,
-        "password": None,
-        "local_store_path": None,
-    }
+    name: str = None
+    imap_ssl_host: str = None
+    imap_ssl_port: int = None
+    pinned_imap_certificate_sha256: str = None
+    smtp_ssl_host: str = None
+    smtp_ssl_port: int = None
+    pinned_smtp_certificate_sha256: str = None
+    username: str = None
+    password: str = None
+    local_store_path: str = None
 
-    def __init__(self, **kwargs):
-        for k, v in kwargs.items():
-            if k not in self.KWARGS:
-                raise SMException(f"Wrong argument for account in config: {k}")
-            setattr(self, k, v)
+    @classmethod
+    def from_dict(cls, d: dict):
+        valid = {f.name for f in fields(cls)}
+        invalid = set(d.keys()) - valid
+        if invalid:
+            raise SMException(f"Wrong argument for account in config: {', '.join(invalid)}")
+        return cls(**d)
 
 
 @locked
@@ -202,7 +204,7 @@ def quick_and_dirty_backup(config):
     # TODO Better login/logout, gracefully fail for any error
     criteria = {}
     uid_max = 0
-    connection_infos = MailConnectionInfos(**config["accounts"][1])  # TODO Parameterize 1, reuse parameter
+    connection_infos = MailConnectionInfos.from_dict(config["accounts"][1])  # TODO Parameterize 1, reuse parameter
     ssl_context = make_pinned_ssl_context(connection_infos.pinned_imap_certificate_sha256)
     mail = IMAP4_SSL(connection_infos.imap_ssl_host, connection_infos.imap_ssl_port, ssl_context=ssl_context)
     mail.login(connection_infos.username, connection_infos.password)
@@ -279,11 +281,12 @@ def send_email(account_config, recipient_email, subject, body, attachment_paths=
             pass
 
 
-def usage(wrong_config=False, wrong_command=False, wrong_arg_len=False):
+def usage(wrong_config=False, wrong_command=False):
     output_lines = [
         "sm - Simple Mail client",
         "───────────────────────",
-        """~/.config/sm/config.json ──➤ {"accounts": [ACCOUNT_INFOS, ACCOUNT_INFOS, ...]}""",
+        """~/.config/sm/config.json ──➤ {"accounts": [ACCOUNT_INFOS, ACCOUNT_INFOS, ...], ...}""",
+        '  - optional: "default_account_for_send": "account_name"',
         "  - ACCOUNT_INFOS = {",
         '    "name": "XX"',
         '    "imap_ssl_host": "XX"',
@@ -296,12 +299,12 @@ def usage(wrong_config=False, wrong_command=False, wrong_arg_len=False):
         '    "pinned_smtp_certificate_sha256": "XX"',
         '    "local_store_path": "XX"',
         "───────────────────────",
-        "- sm send recipient=c4ffein@gmail.com subject=title body=something file=/optional/path ──➤ send a mail",
-        "- sm backup                                                                            ──➤ backup everything",
+        "- sm send recipient=x@y.com subject=title body=something [account=name] [file=path] ──➤ send",
+        "- sm backup                                                                         ──➤ backup",
         "───────────────────────",
         "You need to generate an app specific password for gmail or other mail clients",
     ]
-    red_indexes = (list(range(2, 14)) if wrong_config else []) + ([15] if wrong_command or wrong_arg_len else [])
+    red_indexes = (list(range(2, 16)) if wrong_config else []) + ([17] if wrong_command else [])
     output_lines = [f"\033[93m{line}\033[0m" if i in red_indexes else line for i, line in enumerate(output_lines)]
     print("\n" + "\n".join(output_lines) + "\n")
     return -1
@@ -314,16 +317,17 @@ def consume_args():
         if len(argv) < 2:
             return None
         return {"action": "backup"}
-    allowed_opts = ["recipient", "subject", "body", "file"]
+    allowed_opts = ["recipient", "subject", "body", "file", "account"]
     mandatory_opts = ["recipient", "subject", "body"]
     invalid_options = [v for v in argv[2:] if all(not v.startswith(f"{o}=") for o in allowed_opts)]
     if invalid_options:
         raise SMException(f"Invalid options for send: {'  ;  '.join(invalid_options)}")
-    opts = {v[: v.index("=")]: v[v.index("=") + 1 :] for v in argv[2:] if not v.startswith("file=")}
+    opts = {v[: v.index("=")]: v[v.index("=") + 1 :] for v in argv[2:] if v.startswith(("recipient=", "subject=", "body=", "account="))}
     missing_options = [v for v in mandatory_opts if v not in opts]
     if missing_options:
         raise SMException(f"Missing options for send: {'  ;  '.join(missing_options)}")
     opts["files"] = [v[v.index("=") + 1 :] for v in argv[2:] if v.startswith("file=")]
+    opts.setdefault("account", None)
     return {**opts, "action": "send"}
 
 
@@ -336,18 +340,23 @@ def main():
     if not isinstance(config, dict) or not isinstance(config.get("accounts"), list):
         return usage(wrong_config=True)
     try:
-        mail_connections_infos = [MailConnectionInfos(**s) for s in config["accounts"]]
+        mail_connections_infos = [MailConnectionInfos.from_dict(s) for s in config["accounts"]]
     except Exception:
         return usage(wrong_config=True)
-    main_infos = "gmail"  # TODO Adapt
-    try:
-        selected_account = [m for m in mail_connections_infos if m.name == main_infos][0]
-    except Exception as exc:
-        raise SMException(f"Account named {main_infos} not found") from exc
+    account_names = [m.name for m in mail_connections_infos]
+    if len(account_names) != len(set(account_names)):
+        raise SMException("Duplicate account names in config")
     args = consume_args()
     if not args:
         return usage()
     if args["action"] == "send":
+        account_name = args["account"] or config.get("default_account_for_send")
+        if not account_name:
+            raise SMException("No account specified and no default_account_for_send in config")
+        try:
+            selected_account = [m for m in mail_connections_infos if m.name == account_name][0]
+        except IndexError:
+            raise SMException(f"Account named {account_name} not found") from None
         send_email(selected_account, args["recipient"], args["subject"], args["body"], args["files"])
     elif args["action"] == "backup":
         quick_and_dirty_backup(config)  # TODO Better implem obviously
