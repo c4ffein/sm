@@ -141,12 +141,9 @@ def locked(func):
     def wrapper(*args, **kwargs):
         acquire_lock()
         try:
-            r = func(*args, **kwargs)
-        except SMException as exc:
+            return func(*args, **kwargs)
+        finally:
             release_lock()
-            raise exc
-        release_lock()
-        return r
 
     return wrapper
 
@@ -192,6 +189,7 @@ def save_attachment(store_path: Path, msg):
             with att_path.open("wb") as fp:
                 fp.write(content)
         returned_paths.append(att_path)
+    return returned_paths
 
 
 def search_uid_string(uid_max, criteria):
