@@ -277,11 +277,16 @@ def fetch_emails(account: MailConnectionInfos):
                 parts = item.decode().rsplit('" "', 1)
                 if len(parts) == 2:
                     folders.append(parts[1].rstrip('"'))
+        if not folders:
+            raise SMException(f"No folders found. Raw response: {folder_data[:3]}...")
 
         new_count = 0
         for folder in folders:
             try:
                 status, messages = mail.select(f'"{folder}"')
+                if status != "OK":
+                    print(f"Skipping folder (select failed): {folder}")
+                    continue
             except Exception:
                 print(f"Skipping folder: {folder}")
                 continue
@@ -313,6 +318,7 @@ def fetch_emails(account: MailConnectionInfos):
                         folder_names = [h["folder"] for h in existing.get("history", [])]
                         if folder not in folder_names:
                             existing.setdefault("history", []).append({"folder": folder, "uid": uid})
+                            save_index(store_path, index)
                     else:
                         # New email - save it
                         email_data = message_from_bytes(raw_email)
@@ -327,14 +333,13 @@ def fetch_emails(account: MailConnectionInfos):
                             "internaldate": internaldate,
                             "history": [{"folder": folder, "uid": uid}],
                         }
+                        save_index(store_path, index)
                         new_count += 1
                         print(f"Fetched: {email_data.get('Subject', '(no subject)')[:50]}")
 
         print(f"\nFetched {new_count} new emails for {account.name}")
     finally:
         mail.logout()
-
-    save_index(store_path, index)
 
 
 @raise_smexception_on_connection_error
