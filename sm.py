@@ -18,7 +18,7 @@ from enum import Enum
 from hashlib import sha256
 from imaplib import IMAP4_SSL
 from itertools import chain
-from json import loads
+from json import dumps, loads
 from pathlib import Path
 from smtplib import SMTP, SMTPAuthenticationError
 from socket import gaierror
@@ -49,7 +49,7 @@ Color = Enum("Color", [(k, f"\033[{v}m") for k, v in colors.items()])
 ALLOWED_NAME_CHARS = "qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM0123456789.-_"
 
 
-def make_pinned_ssl_context(pinned_sha_256):
+def make_pinned_ssl_context(pinned_sha_256, cafile=None, capath=None, cadata=None):
     """
     Returns an instance of a subclass of SSLContext that uses a subclass of SSLSocket
     that actually verifies the sha256 of the certificate during the TLS handshake
@@ -71,7 +71,7 @@ def make_pinned_ssl_context(pinned_sha_256):
     class PinnedSSLContext(SSLContext):
         sslsocket_class = PinnedSSLSocket
 
-    def create_pinned_default_context(purpose=Purpose.SERVER_AUTH, *, cafile=None, capath=None, cadata=None):
+    def create_pinned_default_context(purpose=Purpose.SERVER_AUTH):
         if not isinstance(purpose, _ASN1Object):
             raise TypeError(purpose)
         if purpose == Purpose.SERVER_AUTH:  # Verify certs and host name in client mode
@@ -161,6 +161,7 @@ class MailConnectionInfos:
     username: str = None
     password: str = None
     local_store_path: str = None
+    ssl_cafile: str = None
 
     @classmethod
     def from_dict(cls, d: dict):
@@ -205,7 +206,11 @@ def quick_and_dirty_backup(config):
     criteria = {}
     uid_max = 0
     connection_infos = MailConnectionInfos.from_dict(config["accounts"][1])  # TODO Parameterize 1, reuse parameter
-    ssl_context = make_pinned_ssl_context(connection_infos.pinned_imap_certificate_sha256)
+    if connection_infos.ssl_cafile is None:  # Dirty quickfix for global ssl_cafile
+        connection_infos.ssl_cafile = config.get("ssl_cafile")
+    ssl_context = make_pinned_ssl_context(
+        connection_infos.pinned_imap_certificate_sha256, cafile=connection_infos.ssl_cafile
+    )
     mail = IMAP4_SSL(connection_infos.imap_ssl_host, connection_infos.imap_ssl_port, ssl_context=ssl_context)
     mail.login(connection_infos.username, connection_infos.password)
     status, messages = mail.select("inbox")  # TODO Operate on all folders
@@ -237,6 +242,101 @@ def quick_and_dirty_backup(config):
     mail.logout()
 
 
+def load_index(store_path: Path):
+    index_path = store_path / "index.json"
+    if index_path.exists():
+        with index_path.open() as f:
+            return loads(f.read())
+    return {}
+
+
+def save_index(store_path: Path, index: dict):
+    index_path = store_path / "index.json"
+    with index_path.open("w") as f:
+        f.write(dumps(index, indent=2))
+
+
+@raise_smexception_on_connection_error
+def fetch_emails(account: MailConnectionInfos):
+    store_path = Path(account.local_store_path)
+    mails_path = store_path / "mails"
+    mails_path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    index = load_index(store_path)
+
+    ssl_context = make_pinned_ssl_context(account.pinned_imap_certificate_sha256, cafile=account.ssl_cafile)
+    mail = IMAP4_SSL(account.imap_ssl_host, account.imap_ssl_port, ssl_context=ssl_context)
+    mail.login(account.username, account.password)
+
+    try:
+        # List all folders
+        status, folder_data = mail.list()
+        folders = []
+        for item in folder_data:
+            # Parse folder name from response like: b'(\\HasNoChildren) "/" "INBOX"'
+            if isinstance(item, bytes):
+                parts = item.decode().rsplit('" "', 1)
+                if len(parts) == 2:
+                    folders.append(parts[1].rstrip('"'))
+
+        new_count = 0
+        for folder in folders:
+            try:
+                status, messages = mail.select(f'"{folder}"')
+            except Exception:
+                print(f"Skipping folder: {folder}")
+                continue
+
+            result, data = mail.uid("SEARCH", None, "ALL")
+            if not data[0]:
+                continue
+            uids = [int(s) for s in data[0].split()]
+
+            for uid in uids:
+                result, data = mail.uid("fetch", str(uid), "(RFC822 INTERNALDATE)")
+                for response_part in data:
+                    if not isinstance(response_part, tuple):
+                        continue
+                    raw_email = response_part[1]
+                    content_hash = sha256(raw_email).hexdigest()
+
+                    # Parse INTERNALDATE from response
+                    header = response_part[0].decode() if isinstance(response_part[0], bytes) else ""
+                    internaldate = ""
+                    if "INTERNALDATE" in header:
+                        start = header.find('INTERNALDATE "') + 14
+                        end = header.find('"', start)
+                        internaldate = header[start:end]
+
+                    if content_hash in index:
+                        # Update history if new folder
+                        existing = index[content_hash]
+                        folder_names = [h["folder"] for h in existing.get("history", [])]
+                        if folder not in folder_names:
+                            existing.setdefault("history", []).append({"folder": folder, "uid": uid})
+                    else:
+                        # New email - save it
+                        email_data = message_from_bytes(raw_email)
+                        eml_path = mails_path / f"{content_hash}.eml"
+                        with eml_path.open("wb") as f:
+                            f.write(raw_email)
+                        index[content_hash] = {
+                            "message_id": email_data.get("Message-ID", ""),
+                            "subject": email_data.get("Subject", ""),
+                            "from": email_data.get("From", ""),
+                            "date": email_data.get("Date", ""),
+                            "internaldate": internaldate,
+                            "history": [{"folder": folder, "uid": uid}],
+                        }
+                        new_count += 1
+                        print(f"Fetched: {email_data.get('Subject', '(no subject)')[:50]}")
+
+        print(f"\nFetched {new_count} new emails for {account.name}")
+    finally:
+        mail.logout()
+
+    save_index(store_path, index)
+
+
 @raise_smexception_on_connection_error
 def send_email(account_config, recipient_email, subject, body, attachment_paths=None):
     sender_email = account_config.username
@@ -259,7 +359,9 @@ def send_email(account_config, recipient_email, subject, body, attachment_paths=
                 raise SMException(f"Error attaching file {file_path}: {str(e)}") from e
 
     try:
-        ssl_context = make_pinned_ssl_context(account_config.pinned_smtp_certificate_sha256)
+        ssl_context = make_pinned_ssl_context(
+            account_config.pinned_smtp_certificate_sha256, cafile=account_config.ssl_cafile
+        )
     except Exception as e:
         raise SMException(f"Verified TLS Error: {e}") from e
 
@@ -287,6 +389,7 @@ def usage(wrong_config=False, wrong_command=False):
         "───────────────────────",
         """~/.config/sm/config.json ──➤ {"accounts": [ACCOUNT_INFOS, ACCOUNT_INFOS, ...], ...}""",
         '  - optional: "default_account_for_send": "account_name"',
+        '  - optional: "ssl_cafile": "/path/to/ca-bundle.crt"  (global default)',
         "  - ACCOUNT_INFOS = {",
         '    "name": "XX"',
         '    "imap_ssl_host": "XX"',
@@ -298,25 +401,31 @@ def usage(wrong_config=False, wrong_command=False):
         '    "smtp_ssl_port": 587',
         '    "pinned_smtp_certificate_sha256": "XX"',
         '    "local_store_path": "XX"',
+        '    "ssl_cafile": "/optional/override"  (overrides global)',
         "───────────────────────",
         "- sm send recipient=x@y.com subject=title body=something [account=name] [file=path] ──➤ send",
+        "- sm fetch [account=name]                                                           ──➤ fetch",
         "- sm backup                                                                         ──➤ backup",
         "───────────────────────",
         "You need to generate an app specific password for gmail or other mail clients",
     ]
-    red_indexes = (list(range(2, 16)) if wrong_config else []) + ([17] if wrong_command else [])
+    red_indexes = (list(range(2, 18)) if wrong_config else []) + ([19] if wrong_command else [])
     output_lines = [f"\033[93m{line}\033[0m" if i in red_indexes else line for i, line in enumerate(output_lines)]
     print("\n" + "\n".join(output_lines) + "\n")
     return -1
 
 
 def consume_args():
-    if len(argv) < 2 or argv[1] not in ["send", "backup"]:
+    if len(argv) < 2 or argv[1] not in ["send", "fetch", "backup"]:
         return None
     if argv[1] == "backup":
-        if len(argv) < 2:
-            return None
         return {"action": "backup"}
+    if argv[1] == "fetch":
+        account = next((v[v.index("=") + 1 :] for v in argv[2:] if v.startswith("account=")), None)
+        invalid = [v for v in argv[2:] if not v.startswith("account=")]
+        if invalid:
+            raise SMException(f"Invalid options for fetch: {'  ;  '.join(invalid)}")
+        return {"action": "fetch", "account": account}
     allowed_opts = ["recipient", "subject", "body", "file", "account"]
     mandatory_opts = ["recipient", "subject", "body"]
     invalid_options = [v for v in argv[2:] if all(not v.startswith(f"{o}=") for o in allowed_opts)]
@@ -344,6 +453,10 @@ def main():
         mail_connections_infos = [MailConnectionInfos.from_dict(s) for s in config["accounts"]]
     except Exception:
         return usage(wrong_config=True)
+    global_ssl_cafile = config.get("ssl_cafile")
+    for account in mail_connections_infos:
+        if account.ssl_cafile is None:
+            account.ssl_cafile = global_ssl_cafile
     account_names = [m.name for m in mail_connections_infos]
     if len(account_names) != len(set(account_names)):
         raise SMException("Duplicate account names in config")
@@ -359,6 +472,18 @@ def main():
         except IndexError:
             raise SMException(f"Account named {account_name} not found") from None
         send_email(selected_account, args["recipient"], args["subject"], args["body"], args["files"])
+    elif args["action"] == "fetch":
+        if args["account"]:
+            try:
+                accounts = [m for m in mail_connections_infos if m.name == args["account"]]
+                if not accounts:
+                    raise IndexError
+            except IndexError:
+                raise SMException(f"Account named {args['account']} not found") from None
+        else:
+            accounts = mail_connections_infos
+        for account in accounts:
+            fetch_emails(account)
     elif args["action"] == "backup":
         quick_and_dirty_backup(config)  # TODO Better implem obviously
     else:
