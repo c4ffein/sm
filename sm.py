@@ -320,11 +320,27 @@ def fetch_emails(account: MailConnectionInfos):
                             existing.setdefault("history", []).append({"folder": folder, "uid": uid})
                             save_index(store_path, index)
                     else:
-                        # New email - save it
+                        # New email (or orphan recovery)
                         email_data = message_from_bytes(raw_email)
                         eml_path = mails_path / f"{content_hash}.eml"
-                        with eml_path.open("wb") as f:
-                            f.write(raw_email)
+
+                        if eml_path.exists():
+                            # Paranoid mode: orphan .eml exists, verify content matches
+                            with eml_path.open("rb") as f:
+                                existing_hash = sha256(f.read()).hexdigest()
+                            if existing_hash != content_hash:
+                                raise SMException(
+                                    f"Corruption detected: {eml_path} hash mismatch "
+                                    f"(expected {content_hash}, got {existing_hash})"
+                                )
+                            # Orphan recovered, just index it
+                        else:
+                            # Atomic write: temp file + rename
+                            temp_path = mails_path / f".{content_hash}.eml.tmp"
+                            with temp_path.open("wb") as f:
+                                f.write(raw_email)
+                            temp_path.rename(eml_path)
+
                         index[content_hash] = {
                             "message_id": email_data.get("Message-ID", ""),
                             "subject": email_data.get("Subject", ""),
