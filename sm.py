@@ -148,29 +148,52 @@ def raise_smexception_on_connection_error(func):
 
 
 
-def acquire_lock():
-    try:
-        with LOCK_PATH.open("x"):
-            pass
-    except FileExistsError:
-        raise SMException(
-            f"Failed to acquire lock.\nIf no instance of the tool is running, you may remove: {LOCK_PATH}"
-        ) from None
+class Store:
+    _active = False
 
+    def __init__(self, local_store_path):
+        self.store_path = Path(local_store_path)
+        self.mails_path = self.store_path / "mails"
+        self.index = None
 
-def release_lock():
-    LOCK_PATH.unlink()
-
-
-def locked(func):
-    def wrapper(*args, **kwargs):
-        acquire_lock()
+    def __enter__(self):
+        if Store._active:
+            raise SMException("Store is already open")
+        Store._active = True
         try:
-            return func(*args, **kwargs)
-        finally:
-            release_lock()
+            with LOCK_PATH.open("x"):
+                pass
+        except FileExistsError:
+            Store._active = False
+            raise SMException(
+                f"Failed to acquire lock.\nIf no instance of the tool is running, you may remove: {LOCK_PATH}"
+            ) from None
+        try:
+            self.mails_path.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self.index = self._load_index()
+        except OSError as exc:
+            LOCK_PATH.unlink()
+            Store._active = False
+            raise SMException(f"Failed to initialize local store at {self.store_path}: {exc}") from exc
+        return self
 
-    return wrapper
+    def __exit__(self, *exc):
+        LOCK_PATH.unlink()
+        Store._active = False
+
+    def _load_index(self):
+        index_path = self.store_path / "index.json"
+        if index_path.exists():
+            with index_path.open() as f:
+                return loads(f.read())
+        return {}
+
+    def save_index(self):
+        if not Store._active:
+            raise SMException("Cannot save index outside of Store context")
+        index_path = self.store_path / "index.json"
+        with index_path.open("w") as f:
+            f.write(dumps(self.index, indent=2))
 
 
 @dataclass
@@ -196,7 +219,6 @@ class MailConnectionInfos:
         return cls(**d)
 
 
-@locked
 def save_attachment(store_path: Path, msg):
     for file_name in ["index", "files", "mails"]:
         (Path(store_path) / file_name).mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -220,19 +242,11 @@ def save_attachment(store_path: Path, msg):
 
 
 @raise_smexception_on_connection_error
-def _fetch_all_emails(account: MailConnectionInfos):
+def _fetch_all_emails(account: MailConnectionInfos, store: Store):
     """Core: connect, iterate all folders/UIDs, download new emails, update index.
-    Returns (store_path, index, server_state, new_count).
+    Returns (server_state, new_count).
     server_state = {content_hash: [{"folder": ..., "uid": ...}, ...]}
     """
-    store_path = Path(account.local_store_path)
-    mails_path = store_path / "mails"
-    try:
-        mails_path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        index = load_index(store_path)
-    except OSError as exc:
-        raise SMException(f"Failed to initialize local store at {store_path}: {exc}") from exc
-
     ssl_context = make_pinned_ssl_context(account.pinned_imap_certificate_sha256, cafile=account.ssl_cafile)
     mail = IMAP4_SSL(account.imap_ssl_host, account.imap_ssl_port, ssl_context=ssl_context)
     mail.login(account.username, account.password)
@@ -266,8 +280,9 @@ def _fetch_all_emails(account: MailConnectionInfos):
             if not data[0]:
                 continue
             uids = [int(s) for s in data[0].split()]
+            print(f"  {safe_str(folder, allow_newlines=False)}: {len(uids)} email(s)")
 
-            for uid in uids:
+            for i, uid in enumerate(uids, 1):
                 result, data = mail.uid("fetch", str(uid), "(RFC822 INTERNALDATE)")
                 for response_part in data:
                     if not isinstance(response_part, tuple):
@@ -284,17 +299,17 @@ def _fetch_all_emails(account: MailConnectionInfos):
                         end = header.find('"', start)
                         internaldate = header[start:end]
 
-                    if content_hash in index:
-                        existing = index[content_hash]
+                    if content_hash in store.index:
+                        existing = store.index[content_hash]
                         existing.pop("deleted", None)
                         folder_names = [h["folder"] for h in existing.get("history", [])]
                         if folder not in folder_names:
                             existing.setdefault("history", []).append({"folder": folder, "uid": uid})
-                            save_index(store_path, index)
+                            store.save_index()
                     else:
                         # New email (or orphan recovery)
                         email_data = message_from_bytes(raw_email)
-                        eml_path = mails_path / f"{content_hash}.eml"
+                        eml_path = store.mails_path / f"{content_hash}.eml"
 
                         if eml_path.exists():
                             # Paranoid mode: orphan .eml exists, verify content matches
@@ -308,12 +323,12 @@ def _fetch_all_emails(account: MailConnectionInfos):
                             # Orphan recovered, just index it
                         else:
                             # Atomic write: temp file + rename
-                            temp_path = mails_path / f".{content_hash}.eml.tmp"
+                            temp_path = store.mails_path / f".{content_hash}.eml.tmp"
                             with temp_path.open("wb") as f:
                                 f.write(raw_email)
                             temp_path.rename(eml_path)
 
-                        index[content_hash] = {
+                        store.index[content_hash] = {
                             "message_id": email_data.get("Message-ID", ""),
                             "subject": email_data.get("Subject", ""),
                             "from": email_data.get("From", ""),
@@ -321,24 +336,31 @@ def _fetch_all_emails(account: MailConnectionInfos):
                             "internaldate": internaldate,
                             "history": [{"folder": folder, "uid": uid}],
                         }
-                        save_index(store_path, index)
+                        store.save_index()
                         new_count += 1
                         log(f"Fetched: {safe_str(email_data.get('Subject', '(no subject)')[:50], allow_newlines=False)}", Verbosity.DEBUG)
+                print(f"\r    {i}/{len(uids)}", end="", flush=True)
+            if uids:
+                print()
 
-        return store_path, index, server_state, new_count
+        return server_state, new_count
     finally:
         mail.logout()
 
 
 def sync_emails(account: MailConnectionInfos, auto_apply=False):
     """Sync local state with remote: fetch new emails, then detect deletions and moves with user review."""
-    store_path, index, server_state, new_count = _fetch_all_emails(account)
+    with Store(account.local_store_path) as store:
+        server_state, new_count = _fetch_all_emails(account, store)
+        _sync_apply(account, store, server_state, new_count, auto_apply)
 
+
+def _sync_apply(account, store, server_state, new_count, auto_apply):
     if new_count:
         log(f"  Fetched {new_count} new email(s)", Verbosity.INFO)
 
     changelog = []
-    for content_hash, entry in index.items():
+    for content_hash, entry in store.index.items():
         subj = safe_str(entry.get("subject", "(no subject)")[:50], allow_newlines=False)
         if content_hash not in server_state:
             if not entry.get("deleted"):
@@ -385,7 +407,7 @@ def sync_emails(account: MailConnectionInfos, auto_apply=False):
 
     if not apply:
         log("  Server-side changes discarded (newly fetched emails are still saved).", Verbosity.INFO)
-        save_index(store_path, index)
+        store.save_index()
         return
 
     for kind, content_hash, _desc, entry in changelog:
@@ -401,22 +423,10 @@ def sync_emails(account: MailConnectionInfos, auto_apply=False):
                 if h["folder"] not in current_folders:
                     h["removed"] = True
 
-    save_index(store_path, index)
+    store.save_index()
     log(f"  Applied: {len(deletions)} deletion(s), {len(moves)} move(s).", Verbosity.INFO)
 
 
-def load_index(store_path: Path):
-    index_path = store_path / "index.json"
-    if index_path.exists():
-        with index_path.open() as f:
-            return loads(f.read())
-    return {}
-
-
-def save_index(store_path: Path, index: dict):
-    index_path = store_path / "index.json"
-    with index_path.open("w") as f:
-        f.write(dumps(index, indent=2))
 
 
 def format_date(raw_date):
@@ -500,12 +510,15 @@ def kiss_extract_text_from_eml(eml_path):
 
 
 def read_emails(account: MailConnectionInfos):
-    store_path = Path(account.local_store_path)
-    index = load_index(store_path)
-    if not index:
+    with Store(account.local_store_path) as store:
+        _read_emails_ui(account, store)
+
+
+def _read_emails_ui(account, store):
+    if not store.index:
         raise SMException(f"No emails found for account {account.name}. Run sync first.")
 
-    entries = [(h, e) for h, e in index.items() if not e.get("deleted")]
+    entries = [(h, e) for h, e in store.index.items() if not e.get("deleted")]
     entries.sort(key=lambda x: x[1].get("date", ""), reverse=True)
     if not entries:
         raise SMException(f"No non-deleted emails found for account {account.name}.")
@@ -559,7 +572,7 @@ def read_emails(account: MailConnectionInfos):
             idx = int(cmd) - 1
             if 0 <= idx < len(entries):
                 content_hash, entry = entries[idx]
-                eml_path = store_path / "mails" / f"{content_hash}.eml"
+                eml_path = store.mails_path / f"{content_hash}.eml"
                 if not eml_path.exists():
                     print(f"  Email file not found: {eml_path}")
                     continue
