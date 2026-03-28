@@ -5,19 +5,19 @@ sm - Simple Mail client
 MIT License - Copyright (c) 2025 c4ffein
 WARNING: I don't recommand using this as-is. This a PoC, and usable by me because I know what I want to do with it.
 - You can use it if you feel that you can edit the code yourself and you can live with my future breaking changes.
-TODOs and possible improvements: Fill this
 """
 
 import os
+import re
 from dataclasses import dataclass, fields
 from email import encoders, message_from_bytes
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import parsedate_to_datetime
 from enum import Enum
 from hashlib import sha256
 from imaplib import IMAP4_SSL
-from itertools import chain
 from json import dumps, loads
 from pathlib import Path
 from smtplib import SMTP, SMTPAuthenticationError
@@ -45,6 +45,27 @@ LOCK_PATH = Path.home() / ".config" / "sm" / ".lock"
 
 colors = {"RED": "31", "GREEN": "32", "PURP": "34", "DIM": "90", "WHITE": "39"}
 Color = Enum("Color", [(k, f"\033[{v}m") for k, v in colors.items()])
+
+Verbosity = Enum("Verbosity", [("ERROR", 0), ("INFO", 1), ("DEBUG", 2)])
+_verbosity = Verbosity.ERROR
+
+
+def log(msg, level=Verbosity.INFO):
+    if level.value <= _verbosity.value:
+        print(msg)
+
+
+SAFE_PRINT_CHARS = set(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    " -.,;:!?/\\@#$%&*()[]{}=+_'\"<>~`^|"
+    "\t\n\r"
+)
+
+
+def safe_str(text, allow_newlines=True):
+    allowed = SAFE_PRINT_CHARS if allow_newlines else SAFE_PRINT_CHARS - {"\n", "\r"}
+    return "".join(c if c in allowed else "\ufffd" for c in str(text))
+
 
 ALLOWED_NAME_CHARS = "qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM0123456789.-_"
 
@@ -195,69 +216,12 @@ def save_attachment(store_path: Path, msg):
     return returned_paths
 
 
-def search_uid_string(uid_max, criteria):
-    c = [(t0, f'"{t1}"') for t0, t1 in criteria.items()] + [("UID", f"{uid_max + 1}:*")]
-    return f"({' '.join(chain(*c))})"
-
-
 @raise_smexception_on_connection_error
-def quick_and_dirty_backup(config):
-    # TODO Better login/logout, gracefully fail for any error
-    criteria = {}
-    uid_max = 0
-    connection_infos = MailConnectionInfos.from_dict(config["accounts"][1])  # TODO Parameterize 1, reuse parameter
-    if connection_infos.ssl_cafile is None:  # Dirty quickfix for global ssl_cafile
-        connection_infos.ssl_cafile = config.get("ssl_cafile")
-    ssl_context = make_pinned_ssl_context(
-        connection_infos.pinned_imap_certificate_sha256, cafile=connection_infos.ssl_cafile
-    )
-    mail = IMAP4_SSL(connection_infos.imap_ssl_host, connection_infos.imap_ssl_port, ssl_context=ssl_context)
-    mail.login(connection_infos.username, connection_infos.password)
-    status, messages = mail.select("inbox")  # TODO Operate on all folders
-    result, data = mail.uid("SEARCH", None, search_uid_string(uid_max, criteria))
-    uids = [int(s) for s in data[0].split()]
-    print(uids)  # TODO Aggregate and log
-    if uids:
-        uid_max = max(uids)
-
-    for _xii, uid in enumerate(uids):
-        # TODO Here in case the server isn't following UID norms
-        if uid > uid_max or True:  # TODO Make a more comprehensive check before working with uids better?
-            # TODO If we can ensure we can work with uid, don't get those that we already backed up
-            # TODO Handle the deletion of an email by keeping it here but marking it as deleted
-            # TODO Handle the move of an email, check first no confusion with deletion
-            # TODO - if deletion detected, mark for check, once all inboxes obtained again, mark moved or deleted?
-            print(f"\n\n{uid}\n\n")  # TODO Aggregate and log
-            result, data = mail.uid("fetch", str(uid), "(RFC822)")
-            for response_part in data:
-                if isinstance(response_part, tuple):
-                    # TODO work on message_from_bytes or message_from_strings
-                    # TODO save the message as binary and index in an easily consumable way
-                    # response_part[0] is email_identifier
-                    email_data = message_from_bytes(response_part[1])
-                    save_attachment(Path(config["accounts"][1]["local_store_path"]), email_data)  # TODO Parameterize 1
-                    print(response_part[1], email_data.get_payload())  # TODO Better than naive print
-                    # TODO Handle save_at in response_part[1] to compute file name instead?
-            uid_max = uid
-    mail.logout()
-
-
-def load_index(store_path: Path):
-    index_path = store_path / "index.json"
-    if index_path.exists():
-        with index_path.open() as f:
-            return loads(f.read())
-    return {}
-
-
-def save_index(store_path: Path, index: dict):
-    index_path = store_path / "index.json"
-    with index_path.open("w") as f:
-        f.write(dumps(index, indent=2))
-
-
-@raise_smexception_on_connection_error
-def fetch_emails(account: MailConnectionInfos):
+def _fetch_all_emails(account: MailConnectionInfos):
+    """Core: connect, iterate all folders/UIDs, download new emails, update index.
+    Returns (store_path, index, server_state, new_count).
+    server_state = {content_hash: [{"folder": ..., "uid": ...}, ...]}
+    """
     store_path = Path(account.local_store_path)
     mails_path = store_path / "mails"
     mails_path.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -268,11 +232,9 @@ def fetch_emails(account: MailConnectionInfos):
     mail.login(account.username, account.password)
 
     try:
-        # List all folders
         status, folder_data = mail.list()
         folders = []
         for item in folder_data:
-            # Parse folder name from response like: b'(\\HasNoChildren) "/" "INBOX"'
             if isinstance(item, bytes):
                 parts = item.decode().rsplit('" "', 1)
                 if len(parts) == 2:
@@ -280,15 +242,18 @@ def fetch_emails(account: MailConnectionInfos):
         if not folders:
             raise SMException(f"No folders found. Raw response: {folder_data[:3]}...")
 
+        server_state = {}
         new_count = 0
+
         for folder in folders:
             try:
                 status, messages = mail.select(f'"{folder}"')
                 if status != "OK":
-                    print(f"Skipping folder (select failed): {folder}")
-                    continue
+                    log(f"Skipping folder (select failed): {safe_str(folder, allow_newlines=False)}", Verbosity.DEBUG)
+                    continue  # TODO: collect into structured warnings to surface in sync summary
             except Exception:
-                print(f"Skipping folder: {folder}")
+                log(f"Skipping folder: {safe_str(folder, allow_newlines=False)}", Verbosity.DEBUG)
+                # TODO: collect into structured warnings to surface in sync summary
                 continue
 
             result, data = mail.uid("SEARCH", None, "ALL")
@@ -304,7 +269,8 @@ def fetch_emails(account: MailConnectionInfos):
                     raw_email = response_part[1]
                     content_hash = sha256(raw_email).hexdigest()
 
-                    # Parse INTERNALDATE from response
+                    server_state.setdefault(content_hash, []).append({"folder": folder, "uid": uid})
+
                     header = response_part[0].decode() if isinstance(response_part[0], bytes) else ""
                     internaldate = ""
                     if "INTERNALDATE" in header:
@@ -313,8 +279,8 @@ def fetch_emails(account: MailConnectionInfos):
                         internaldate = header[start:end]
 
                     if content_hash in index:
-                        # Update history if new folder
                         existing = index[content_hash]
+                        existing.pop("deleted", None)
                         folder_names = [h["folder"] for h in existing.get("history", [])]
                         if folder not in folder_names:
                             existing.setdefault("history", []).append({"folder": folder, "uid": uid})
@@ -351,18 +317,114 @@ def fetch_emails(account: MailConnectionInfos):
                         }
                         save_index(store_path, index)
                         new_count += 1
-                        print(f"Fetched: {email_data.get('Subject', '(no subject)')[:50]}")
+                        log(f"Fetched: {safe_str(email_data.get('Subject', '(no subject)')[:50], allow_newlines=False)}", Verbosity.DEBUG)
 
-        print(f"\nFetched {new_count} new emails for {account.name}")
+        return store_path, index, server_state, new_count
     finally:
         mail.logout()
 
 
+def sync_emails(account: MailConnectionInfos, auto_apply=False):
+    """Sync local state with remote: fetch new emails, then detect deletions and moves with user review."""
+    store_path, index, server_state, new_count = _fetch_all_emails(account)
+
+    if new_count:
+        log(f"  Fetched {new_count} new email(s)", Verbosity.INFO)
+
+    changelog = []
+    for content_hash, entry in index.items():
+        subj = safe_str(entry.get("subject", "(no subject)")[:50], allow_newlines=False)
+        if content_hash not in server_state:
+            if not entry.get("deleted"):
+                changelog.append(("D", content_hash, subj, entry))
+        else:
+            current_folders = {loc["folder"] for loc in server_state[content_hash]}
+            previous_folders = {h["folder"] for h in entry.get("history", []) if not h.get("removed")}
+            new_folders = current_folders - previous_folders
+            removed_folders = previous_folders - current_folders
+            if new_folders or removed_folders:
+                prev = ", ".join(safe_str(f, allow_newlines=False) for f in sorted(removed_folders)) if removed_folders else ""
+                curr = ", ".join(safe_str(f, allow_newlines=False) for f in sorted(new_folders)) if new_folders else ""
+                desc = f"{prev} -> {curr}" if prev and curr else (f"-> {curr}" if curr else f"{prev} -> (removed)")
+                changelog.append(("M", content_hash, f"{subj}  ({desc})", entry))
+
+    if not changelog:
+        log(f"\nSync complete for {account.name}: {new_count} new, no server-side changes detected.", Verbosity.INFO)
+        return
+
+    try:
+        term_width = os.get_terminal_size().columns
+    except (ValueError, OSError):
+        term_width = 80
+
+    deletions = [c for c in changelog if c[0] == "D"]
+    moves = [c for c in changelog if c[0] == "M"]
+
+    print(f"\n{'─' * term_width}")
+    print(f"  {account.name} — {new_count} new, {len(deletions)} deletion(s), {len(moves)} move(s) detected")
+    print(f"{'─' * term_width}")
+    for kind, _hash, desc, _entry in changelog:
+        tag = f"{Color.RED.value}[D]{Color.WHITE.value}" if kind == "D" else f"{Color.PURP.value}[M]{Color.WHITE.value}"
+        print(f"  {tag}  {desc}")
+    print(f"{'─' * term_width}")
+
+    if auto_apply:
+        apply = True
+    else:
+        try:
+            cmd = input("  Apply these changes to local index? [y/n] ").strip().lower()
+        except EOFError:
+            cmd = "n"
+        apply = cmd in ("y", "yes")
+
+    if not apply:
+        log("  Server-side changes discarded (newly fetched emails are still saved).", Verbosity.INFO)
+        save_index(store_path, index)
+        return
+
+    for kind, content_hash, _desc, entry in changelog:
+        if kind == "D":
+            entry["deleted"] = True
+        elif kind == "M":
+            current_folders = {loc["folder"] for loc in server_state[content_hash]}
+            for loc in server_state[content_hash]:
+                folder_names = [h["folder"] for h in entry.get("history", [])]
+                if loc["folder"] not in folder_names:
+                    entry.setdefault("history", []).append(loc)
+            for h in entry.get("history", []):
+                if h["folder"] not in current_folders:
+                    h["removed"] = True
+
+    save_index(store_path, index)
+    log(f"  Applied: {len(deletions)} deletion(s), {len(moves)} move(s).", Verbosity.INFO)
+
+
+def load_index(store_path: Path):
+    index_path = store_path / "index.json"
+    if index_path.exists():
+        with index_path.open() as f:
+            return loads(f.read())
+    return {}
+
+
+def save_index(store_path: Path, index: dict):
+    index_path = store_path / "index.json"
+    with index_path.open("w") as f:
+        f.write(dumps(index, indent=2))
+
+
+def format_date(raw_date):
+    try:
+        return parsedate_to_datetime(raw_date).strftime("%Y-%m-%d:%H-%M-%S%z")
+    except Exception:
+        return safe_str(raw_date or "", allow_newlines=False)
+
+
 @raise_smexception_on_connection_error
-def send_email(account_config, recipient_email, subject, body, attachment_paths=None):
+def send_email(account_config, recipients, subject, body, attachment_paths=None):
     sender_email = account_config.username
     message = MIMEMultipart()
-    for k, v in {"From": sender_email, "To": recipient_email, "Subject": subject}.items():
+    for k, v in {"From": sender_email, "To": ", ".join(recipients), "Subject": subject}.items():
         message[k] = v
     message.attach(MIMEText(body, "plain"))
     if attachment_paths:
@@ -391,8 +453,8 @@ def send_email(account_config, recipient_email, subject, body, attachment_paths=
         server.starttls(context=ssl_context)
         server.login(sender_email, account_config.password)
         text = message.as_string()
-        server.sendmail(sender_email, recipient_email, text)
-        print("Email sent successfully!")
+        server.sendmail(sender_email, recipients, text)
+        log("Email sent successfully!", Verbosity.INFO)
     except SMTPAuthenticationError as exc:
         raise SMException(f"Auth error:\n{str(exc)}") from exc
     except Exception as exc:
@@ -402,6 +464,119 @@ def send_email(account_config, recipient_email, subject, body, attachment_paths=
             server.quit()
         except Exception:
             pass
+
+
+def kiss_extract_text_from_eml(eml_path):
+    """Naive text extraction: prefers text/plain, falls back to tag-stripped HTML.
+    HTML handling is intentionally dumb (no entity decoding, no style/script removal) — good enough until it isn't."""
+    with Path(eml_path).open("rb") as f:
+        msg = message_from_bytes(f.read())
+    text_parts = []
+    html_parts = []
+    for part in msg.walk():
+        content_type = part.get_content_type()
+        if content_type == "text/plain":
+            payload = part.get_payload(decode=True)
+            if payload:
+                text_parts.append(payload.decode(part.get_content_charset() or "utf-8", errors="replace"))
+        elif content_type == "text/html":
+            payload = part.get_payload(decode=True)
+            if payload:
+                html_parts.append(payload.decode(part.get_content_charset() or "utf-8", errors="replace"))
+    if text_parts:
+        return "\n".join(text_parts)
+    if html_parts:
+        html = "\n".join(html_parts)
+        html = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
+        html = re.sub(r"<[^>]+>", "", html)
+        return html
+    return "(no text content)"
+
+
+def read_emails(account: MailConnectionInfos):
+    store_path = Path(account.local_store_path)
+    index = load_index(store_path)
+    if not index:
+        raise SMException(f"No emails found for account {account.name}. Run sync first.")
+
+    entries = [(h, e) for h, e in index.items() if not e.get("deleted")]
+    entries.sort(key=lambda x: x[1].get("date", ""), reverse=True)
+    if not entries:
+        raise SMException(f"No non-deleted emails found for account {account.name}.")
+
+    page_size = 20
+    page = 0
+    total_pages = (len(entries) + page_size - 1) // page_size
+
+    try:
+        term_width = os.get_terminal_size().columns
+    except (ValueError, OSError):
+        term_width = 80
+
+    while True:
+        start = page * page_size
+        end = min(start + page_size, len(entries))
+        page_entries = entries[start:end]
+
+        print(f"\n{'─' * term_width}")
+        print(f"  {account.name} — Page {page + 1}/{total_pages} ({len(entries)} emails)")
+        print(f"{'─' * term_width}")
+
+        for i, (_content_hash, entry) in enumerate(page_entries):
+            num = start + i + 1
+            frm = safe_str(entry.get("from", "")[:30], allow_newlines=False)
+            date = format_date(entry.get("date", ""))
+            subj = safe_str(entry.get("subject", "(no subject)"), allow_newlines=False)
+            prefix = f"  {num:>4}  {frm:<30}  {date:<24}  "
+            max_subj = term_width - len(prefix) - 1
+            if max_subj > 0 and len(subj) > max_subj:
+                subj = subj[: max_subj - 1] + "…"
+            print(f"{prefix}{subj}")
+
+        print(f"{'─' * term_width}")
+        print("  [number] read  |  [n]ext  [p]rev  [q]uit")
+
+        try:
+            cmd = input("\n> ").strip().lower()
+        except EOFError:
+            break
+
+        if cmd == "q":
+            break
+        elif cmd == "n":
+            if page < total_pages - 1:
+                page += 1
+        elif cmd == "p":
+            if page > 0:
+                page -= 1
+        elif cmd.isdigit():
+            idx = int(cmd) - 1
+            if 0 <= idx < len(entries):
+                content_hash, entry = entries[idx]
+                eml_path = store_path / "mails" / f"{content_hash}.eml"
+                if not eml_path.exists():
+                    print(f"  Email file not found: {eml_path}")
+                    continue
+
+                print(f"\n{'═' * term_width}")
+                print(f"  From:    {safe_str(entry.get('from', ''), allow_newlines=False)}")
+                print(f"  Date:    {format_date(entry.get('date', ''))}")
+                print(f"  Subject: {safe_str(entry.get('subject', ''), allow_newlines=False)}")
+                print(f"{'═' * term_width}")
+                print(safe_str(kiss_extract_text_from_eml(eml_path), allow_newlines=True))
+                print(f"{'═' * term_width}")
+                print("  [b]ack to list  [q]uit")
+
+                try:
+                    cmd2 = input("\n> ").strip().lower()
+                except EOFError:
+                    break
+                if cmd2 == "q":
+                    break
+            else:
+                print(f"  Invalid number. Enter 1-{len(entries)}")
+        else:
+            print("  Unknown command.")
 
 
 def usage(wrong_config=False, wrong_command=False):
@@ -424,10 +599,11 @@ def usage(wrong_config=False, wrong_command=False):
         '    "local_store_path": "XX"',
         '    "ssl_cafile": "/optional/override"  (overrides global)',
         "───────────────────────",
-        "- sm send recipient=x@y.com subject=title body=something [account=name] [file=path] ──➤ send",
-        "- sm fetch [account=name]                                                           ──➤ fetch",
-        "- sm backup                                                                         ──➤ backup",
+        "- sm send recipient=a@b.com [recipient=c@d.com ...] subject=title body=something [account=name] [file=path]",
+        "- sm sync [account=name] [yes] [verbose=0|1|2]      ──➤ fetch new + review deletions/moves",
+        "- sm read [account=name]                             ──➤ read emails in terminal",
         "───────────────────────",
+        "  verbose= accepts 0/1/2 or error/info/debug (applies to all commands)",
         "You need to generate an app specific password for gmail or other mail clients",
     ]
     red_indexes = (list(range(2, 18)) if wrong_config else []) + ([19] if wrong_command else [])
@@ -437,29 +613,56 @@ def usage(wrong_config=False, wrong_command=False):
 
 
 def consume_args():
-    if len(argv) < 2 or argv[1] not in ["send", "fetch", "backup"]:
+    if len(argv) < 2 or argv[1] not in ["send", "sync", "read"]:
         return None
-    if argv[1] == "backup":
-        return {"action": "backup"}
-    if argv[1] == "fetch":
-        account = next((v[v.index("=") + 1 :] for v in argv[2:] if v.startswith("account=")), None)
-        invalid = [v for v in argv[2:] if not v.startswith("account=")]
+    remaining = [v for v in argv[2:] if not v.startswith("verbose=")]
+    verbose_args = [v for v in argv[2:] if v.startswith("verbose=")]
+    if verbose_args:
+        val = verbose_args[-1].split("=", 1)[1].lower()
+        mapping = {"0": "ERROR", "1": "INFO", "2": "DEBUG", "error": "ERROR", "info": "INFO", "debug": "DEBUG"}
+        if val not in mapping:
+            raise SMException(f"Invalid verbose level: {val} (use 0/1/2 or error/info/debug)")
+        global _verbosity
+        _verbosity = Verbosity[mapping[val]]
+    if argv[1] == "sync":
+        account = next((v[v.index("=") + 1 :] for v in remaining if v.startswith("account=")), None)
+        auto_apply = "yes" in remaining
+        invalid = [v for v in remaining if not v.startswith("account=") and v != "yes"]
         if invalid:
-            raise SMException(f"Invalid options for fetch: {'  ;  '.join(invalid)}")
-        return {"action": "fetch", "account": account}
+            raise SMException(f"Invalid options for sync: {'  ;  '.join(invalid)}")
+        return {"action": "sync", "account": account, "auto_apply": auto_apply}
+    if argv[1] == "read":
+        account = next((v[v.index("=") + 1 :] for v in remaining if v.startswith("account=")), None)
+        invalid = [v for v in remaining if not v.startswith("account=")]
+        if invalid:
+            raise SMException(f"Invalid options for read: {'  ;  '.join(invalid)}")
+        return {"action": "read", "account": account}
+    # send
     allowed_opts = ["recipient", "subject", "body", "file", "account"]
-    mandatory_opts = ["recipient", "subject", "body"]
-    invalid_options = [v for v in argv[2:] if all(not v.startswith(f"{o}=") for o in allowed_opts)]
+    mandatory_opts = ["subject", "body"]
+    invalid_options = [v for v in remaining if all(not v.startswith(f"{o}=") for o in allowed_opts)]
     if invalid_options:
         raise SMException(f"Invalid options for send: {'  ;  '.join(invalid_options)}")
-    single_opts = ("recipient=", "subject=", "body=", "account=")
-    opts = {v[: v.index("=")]: v[v.index("=") + 1 :] for v in argv[2:] if v.startswith(single_opts)}
+    single_opts = ("subject=", "body=", "account=")
+    opts = {v[: v.index("=")]: v[v.index("=") + 1 :] for v in remaining if v.startswith(single_opts)}
     missing_options = [v for v in mandatory_opts if v not in opts]
     if missing_options:
         raise SMException(f"Missing options for send: {'  ;  '.join(missing_options)}")
-    opts["files"] = [v[v.index("=") + 1 :] for v in argv[2:] if v.startswith("file=")]
+    opts["recipients"] = [v[v.index("=") + 1 :] for v in remaining if v.startswith("recipient=")]
+    if not opts["recipients"]:
+        raise SMException("Missing options for send: recipient")
+    opts["files"] = [v[v.index("=") + 1 :] for v in remaining if v.startswith("file=")]
     opts.setdefault("account", None)
     return {**opts, "action": "send"}
+
+
+def resolve_accounts(mail_connections_infos, account_name):
+    if account_name:
+        accounts = [m for m in mail_connections_infos if m.name == account_name]
+        if not accounts:
+            raise SMException(f"Account named {account_name} not found")
+        return accounts
+    return list(mail_connections_infos)
 
 
 def main():
@@ -488,25 +691,20 @@ def main():
         account_name = args["account"] or config.get("default_account_for_send")
         if not account_name:
             raise SMException("No account specified and no default_account_for_send in config")
-        try:
-            selected_account = [m for m in mail_connections_infos if m.name == account_name][0]
-        except IndexError:
-            raise SMException(f"Account named {account_name} not found") from None
-        send_email(selected_account, args["recipient"], args["subject"], args["body"], args["files"])
-    elif args["action"] == "fetch":
-        if args["account"]:
-            try:
-                accounts = [m for m in mail_connections_infos if m.name == args["account"]]
-                if not accounts:
-                    raise IndexError
-            except IndexError:
-                raise SMException(f"Account named {args['account']} not found") from None
+        send_email(
+            resolve_accounts(mail_connections_infos, account_name)[0],
+            args["recipients"], args["subject"], args["body"], args["files"],
+        )
+    elif args["action"] == "sync":
+        for account in resolve_accounts(mail_connections_infos, args["account"]):
+            sync_emails(account, auto_apply=args["auto_apply"])
+    elif args["action"] == "read":
+        accounts = resolve_accounts(mail_connections_infos, args["account"])
+        if len(accounts) == 1:
+            read_emails(accounts[0])
         else:
-            accounts = mail_connections_infos
-        for account in accounts:
-            fetch_emails(account)
-    elif args["action"] == "backup":
-        quick_and_dirty_backup(config)  # TODO Better implem obviously
+            names = ", ".join(m.name for m in accounts)
+            raise SMException(f"Multiple accounts configured. Specify one with account=name\nAvailable: {names}")
     else:
         return usage()
 
