@@ -124,13 +124,13 @@ def raise_smexception_on_connection_error(func):
     def wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
+        except SMException:
+            raise
         except HTTPError as exc:
             raise SMException(f"HTTP Error when reaching server: {exc.code}") from exc
         except socket_timeout as exc:
             raise SMException("Timed out") from exc
         except Exception as exc:
-            if isinstance(exc, SMException):
-                raise exc
             if isinstance(getattr(exc, "reason", None), socket_timeout):
                 raise SMException("TLS timed out") from exc  # Most probable cause, should check this is always the case
             if isinstance(getattr(exc, "reason", None), gaierror):
@@ -143,6 +143,7 @@ def raise_smexception_on_connection_error(func):
             raise SMException("Unknown error when trying to reach server") from exc
 
     return wrapper
+
 
 
 def acquire_lock():
@@ -224,8 +225,11 @@ def _fetch_all_emails(account: MailConnectionInfos):
     """
     store_path = Path(account.local_store_path)
     mails_path = store_path / "mails"
-    mails_path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    index = load_index(store_path)
+    try:
+        mails_path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        index = load_index(store_path)
+    except OSError as exc:
+        raise SMException(f"Failed to initialize local store at {store_path}: {exc}") from exc
 
     ssl_context = make_pinned_ssl_context(account.pinned_imap_certificate_sha256, cafile=account.ssl_cafile)
     mail = IMAP4_SSL(account.imap_ssl_host, account.imap_ssl_port, ssl_context=ssl_context)
