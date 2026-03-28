@@ -137,6 +137,8 @@ def raise_smexception_on_connection_error(func):
                 raise SMException("Failed domain name resolution") from exc
             if isinstance(getattr(exc, "reason", None), SSLCertVerificationError):
                 raise SMException("Failed SSL cert validation") from exc
+            if isinstance(exc, gaierror):
+                raise SMException("Failed domain name resolution") from exc
             if isinstance(exc, SSLCertVerificationError):
                 raise SMException("Failed SSL cert validation") from exc
             # Keeping this as-is for now, should not happen if everything is handled correctly, add any necessary ones
