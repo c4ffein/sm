@@ -184,16 +184,20 @@ class Store:
     def _load_index(self):
         index_path = self.store_path / "index.json"
         if index_path.exists():
-            with index_path.open() as f:
-                return loads(f.read())
+            content = index_path.read_text()
+            if not content.strip():
+                return {}
+            return loads(content)
         return {}
 
     def save_index(self):
         if not Store._active:
             raise SMException("Cannot save index outside of Store context")
         index_path = self.store_path / "index.json"
-        with index_path.open("w") as f:
+        temp_path = self.store_path / ".index.json.tmp"
+        with temp_path.open("w") as f:
             f.write(dumps(self.index, indent=2))
+        temp_path.rename(index_path)
 
 
 @dataclass
