@@ -262,6 +262,17 @@ def _fetch_all_emails(account: MailConnectionInfos, store: Store):
         if not folders:
             raise SMException(f"No folders found. Raw response: {folder_data[:3]}...")
 
+        # Build reverse lookup: (folder, uid) -> content_hash from existing index
+        # TODO: UIDVALIDITY — IMAP assigns a UIDVALIDITY value per folder (returned on SELECT).
+        #   As long as it stays the same, UIDs are stable and never reused. If it changes (server
+        #   rebuild, migration, etc.), all cached (folder, uid) mappings are invalid.
+        #   We should store UIDVALIDITY per folder in the index, check it on SELECT, and when it
+        #   changes, invalidate cached UIDs for that folder and re-fetch to re-link emails to new UIDs.
+        known_uids = {}
+        for content_hash, entry in store.index.items():
+            for h in entry.get("history", []):
+                known_uids[(h["folder"], h["uid"])] = content_hash
+
         server_state = {}
         new_count = 0
 
@@ -283,6 +294,12 @@ def _fetch_all_emails(account: MailConnectionInfos, store: Store):
             print(f"  {safe_str(folder, allow_newlines=False)}: {len(uids)} email(s)")
 
             for i, uid in enumerate(uids, 1):
+                cached_hash = known_uids.get((folder, uid))
+                if cached_hash and (store.mails_path / f"{cached_hash}.eml").exists():
+                    server_state.setdefault(cached_hash, []).append({"folder": folder, "uid": uid})
+                    print(f"\r    {i}/{len(uids)}", end="", flush=True)
+                    continue
+
                 result, data = mail.uid("fetch", str(uid), "(RFC822 INTERNALDATE)")
                 for response_part in data:
                     if not isinstance(response_part, tuple):
