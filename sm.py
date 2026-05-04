@@ -17,6 +17,7 @@ from email.mime.text import MIMEText
 from email.utils import parsedate_to_datetime
 from enum import Enum
 from hashlib import sha256
+from html import unescape
 from imaplib import IMAP4_SSL
 from json import dumps, loads
 from pathlib import Path
@@ -526,7 +527,7 @@ def kiss_extract_text_from_eml(eml_path):
         html = "\n".join(html_parts)
         html = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
         html = re.sub(r"<[^>]+>", "", html)
-        return html
+        return unescape(html)
     return "(no text content)"
 
 
