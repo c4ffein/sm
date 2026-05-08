@@ -1,8 +1,14 @@
 """Tests for sm. Run from repo root: python3 -m unittest discover tests"""
+import hashlib
 import io
+import socketserver
+import ssl
+import subprocess
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stdout
+from email import message_from_bytes
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -16,6 +22,7 @@ from sm import (
     Store,
     Verbosity,
     _is_safe_folder_name,
+    build_email_message,
     consume_args,
     decode_modified_utf7,
     internaldate_key,
@@ -24,6 +31,7 @@ from sm import (
     parse_list_response,
     safe_str,
     save_attachment_bytes,
+    send_email,
 )
 
 
@@ -735,6 +743,285 @@ class TestIsSafeFolderName(unittest.TestCase):
         # Empty string passes the per-byte check (no bytes to fail on). The parser rejects empty
         # atom names separately; this predicate is purely about character safety.
         self.assertTrue(_is_safe_folder_name(""))
+
+
+class TestBuildEmailMessage(unittest.TestCase):
+    def test_basic_headers(self):
+        msg = build_email_message("me@example.com", ["a@b.c"], "hello", "body")
+        self.assertEqual(msg["From"], "me@example.com")
+        self.assertEqual(msg["To"], "a@b.c")
+        self.assertEqual(msg["Subject"], "hello")
+
+    def test_multiple_recipients_joined_with_comma(self):
+        msg = build_email_message("me@x", ["a@b.c", "d@e.f"], "s", "b")
+        self.assertEqual(msg["To"], "a@b.c, d@e.f")
+
+    def test_body_is_text_plain(self):
+        msg = build_email_message("me@x", ["a@b.c"], "s", "the body")
+        # Walk to find text/plain part
+        text = None
+        for part in msg.walk():
+            if part.get_content_type() == "text/plain":
+                text = part.get_payload(decode=True).decode()
+                break
+        self.assertEqual(text, "the body")
+
+    def test_no_attachments_by_default(self):
+        msg = build_email_message("me@x", ["a@b.c"], "s", "b")
+        atts = list_attachments(message_from_bytes(msg.as_bytes()))
+        self.assertEqual(atts, [])
+
+    def test_attachment_attached(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "data.bin"
+            f.write_bytes(b"\x01\x02\x03payload")
+            msg = build_email_message("me@x", ["a@b.c"], "s", "b", [str(f)])
+            atts = list_attachments(message_from_bytes(msg.as_bytes()))
+            self.assertEqual(len(atts), 1)
+            name, content = atts[0]
+            self.assertEqual(name, "data.bin")
+            self.assertEqual(content, b"\x01\x02\x03payload")
+
+    def test_multiple_attachments_preserve_order(self):
+        with tempfile.TemporaryDirectory() as d:
+            paths = []
+            for n, body in enumerate([b"first", b"second", b"third"]):
+                p = Path(d) / f"f{n}.bin"
+                p.write_bytes(body)
+                paths.append(str(p))
+            msg = build_email_message("me@x", ["a@b.c"], "s", "b", paths)
+            atts = list_attachments(message_from_bytes(msg.as_bytes()))
+            self.assertEqual([n for n, _ in atts], ["f0.bin", "f1.bin", "f2.bin"])
+            self.assertEqual([c for _, c in atts], [b"first", b"second", b"third"])
+
+    def test_missing_attachment_raises_smexception(self):
+        with self.assertRaises(SMException) as cm:
+            build_email_message("me@x", ["a@b.c"], "s", "b", ["/no/such/file.bin"])
+        self.assertIn("Error attaching file", str(cm.exception))
+
+
+# ─── SMTP fake server + integration tests for send_email ─────────────────────────
+
+def _generate_test_cert():
+    """Generate a self-signed cert+key in a tempdir using the system openssl. Returns
+    (cert_path, key_path, sha256_hex, tempdir) or None if openssl is unavailable."""
+    tmp = tempfile.mkdtemp(prefix="sm-test-cert-")
+    cert_path = Path(tmp) / "cert.pem"
+    key_path = Path(tmp) / "key.pem"
+    try:
+        subprocess.run(
+            [
+                "openssl", "req", "-x509", "-newkey", "rsa:2048",
+                "-keyout", str(key_path), "-out", str(cert_path),
+                "-days", "1", "-nodes", "-subj", "/CN=localhost",
+            ],
+            check=True, capture_output=True, timeout=15,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+    der = ssl.PEM_cert_to_DER_cert(cert_path.read_text())
+    cert_sha256 = hashlib.sha256(der).hexdigest()
+    return cert_path, key_path, cert_sha256, tmp
+
+
+class _FakeSMTPServer:
+    """Threaded SMTP-with-STARTTLS server for testing. Captures the delivered message bytes
+    in `self.delivered` and the envelope in `self.mail_from` / `self.rcpts`. Set `fail_auth=True`
+    to simulate AUTH failure."""
+
+    def __init__(self, cert_path, key_path, *, fail_auth=False):
+        self.cert_path = str(cert_path)
+        self.key_path = str(key_path)
+        self.fail_auth = fail_auth
+        self.delivered = None
+        self.mail_from = None
+        self.rcpts = []
+        self.host = "127.0.0.1"
+        self.port = None
+        self._server = None
+        self._thread = None
+
+    def start(self):
+        outer = self
+        class Handler(socketserver.StreamRequestHandler):
+            timeout = 5
+
+            def _w(self, line):
+                self.wfile.write(line.encode("ascii") + b"\r\n")
+                self.wfile.flush()
+
+            def handle(self):
+                self._ssl_sock = None
+                try:
+                    self._handle()
+                except (BrokenPipeError, ConnectionResetError, OSError, ssl.SSLError):
+                    pass  # client disconnected (e.g. after auth failure or pinning mismatch); not an error
+                finally:
+                    # When STARTTLS replaces self.connection, socketserver only knows about the original
+                    # plain socket — the SSL-wrapped one leaks unless we close it ourselves.
+                    if self._ssl_sock is not None:
+                        try:
+                            self._ssl_sock.close()
+                        except (OSError, ssl.SSLError):
+                            pass
+
+            def _handle(self):
+                self._w("220 fake.localhost SMTP")
+                in_tls = False
+                while True:
+                    raw = self.rfile.readline()
+                    if not raw:
+                        return
+                    line = raw.decode("ascii", "replace").rstrip("\r\n")
+                    cmd = line.split(" ", 1)[0].upper() if line else ""
+                    if cmd in ("HELO", "EHLO"):
+                        # advertise STARTTLS + AUTH PLAIN
+                        self._w("250-localhost")
+                        self._w("250-AUTH PLAIN")
+                        self._w("250 STARTTLS")
+                    elif cmd == "STARTTLS" and not in_tls:
+                        self._w("220 ready")
+                        ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+                        ctx.load_cert_chain(certfile=outer.cert_path, keyfile=outer.key_path)
+                        self.connection = ctx.wrap_socket(self.connection, server_side=True)
+                        self._ssl_sock = self.connection
+                        self.rfile = self.connection.makefile("rb", -1)
+                        self.wfile = self.connection.makefile("wb", 0)
+                        in_tls = True
+                    elif cmd == "AUTH":
+                        if outer.fail_auth:
+                            self._w("535 5.7.8 authentication failed")
+                            continue
+                        rest = line[5:].strip()
+                        if rest.upper().startswith("PLAIN "):
+                            self._w("235 2.7.0 authenticated")
+                        elif rest.upper() == "PLAIN":
+                            self._w("334 ")
+                            self.rfile.readline()  # eat credentials
+                            self._w("235 2.7.0 authenticated")
+                        else:
+                            self._w("504 5.5.4 mechanism not supported")
+                    elif cmd == "MAIL":
+                        outer.mail_from = line.split(":", 1)[1].strip().strip("<>")
+                        self._w("250 ok")
+                    elif cmd == "RCPT":
+                        outer.rcpts.append(line.split(":", 1)[1].strip().strip("<>"))
+                        self._w("250 ok")
+                    elif cmd == "DATA":
+                        self._w("354 end with <CRLF>.<CRLF>")
+                        chunks = []
+                        while True:
+                            data_line = self.rfile.readline()
+                            if data_line in (b".\r\n", b".\n"):
+                                break
+                            if data_line.startswith(b"."):  # SMTP dot-stuffing
+                                data_line = data_line[1:]
+                            chunks.append(data_line)
+                        outer.delivered = b"".join(chunks)
+                        self._w("250 ok")
+                    elif cmd == "QUIT":
+                        self._w("221 bye")
+                        return
+                    elif cmd == "RSET":
+                        self._w("250 ok")
+                    elif cmd == "NOOP":
+                        self._w("250 ok")
+                    else:
+                        self._w(f"500 unknown: {line[:30]}")
+
+        class _Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        self._server = _Server((self.host, 0), Handler)
+        self.port = self._server.server_address[1]
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        if self._server:
+            self._server.shutdown()
+            self._server.server_close()
+        if self._thread:
+            self._thread.join(timeout=2)
+
+
+class TestSendEmailIntegration(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cert_data = _generate_test_cert()
+        if cert_data is None:
+            raise unittest.SkipTest("openssl not available — skipping send_email integration tests")
+        cls.cert_path, cls.key_path, cls.cert_sha256, cls._cert_tmpdir = cert_data
+
+    def _make_account(self, port):
+        return MailConnectionInfos(
+            name="test",
+            username="user@localhost",
+            password="hunter2",
+            smtp_ssl_host="localhost",  # must match cert CN
+            smtp_ssl_port=port,
+            pinned_smtp_certificate_sha256=self.cert_sha256,
+            ssl_cafile=str(self.cert_path),  # trust our self-signed CA
+        )
+
+    def setUp(self):
+        self.fake = _FakeSMTPServer(self.cert_path, self.key_path)
+        self.fake.start()
+
+    def tearDown(self):
+        self.fake.stop()
+
+    def test_basic_send(self):
+        account = self._make_account(self.fake.port)
+        send_email(account, ["recipient@example.com"], "Hello", "body text", Context())
+        # Envelope captured
+        self.assertEqual(self.fake.mail_from, "user@localhost")
+        self.assertEqual(self.fake.rcpts, ["recipient@example.com"])
+        # Message body captured + parses correctly
+        self.assertIsNotNone(self.fake.delivered)
+        delivered_msg = message_from_bytes(self.fake.delivered)
+        self.assertEqual(delivered_msg["From"], "user@localhost")
+        self.assertEqual(delivered_msg["To"], "recipient@example.com")
+        self.assertEqual(delivered_msg["Subject"], "Hello")
+        # Body inside the multipart
+        body = next(p for p in delivered_msg.walk() if p.get_content_type() == "text/plain")
+        self.assertEqual(body.get_payload(decode=True).decode().strip(), "body text")
+
+    def test_send_with_attachment(self):
+        with tempfile.TemporaryDirectory() as d:
+            attachment = Path(d) / "report.bin"
+            attachment.write_bytes(b"PAYLOAD\x00\xff")
+            account = self._make_account(self.fake.port)
+            send_email(account, ["a@b.c"], "subj", "msg", Context(), attachment_paths=[str(attachment)])
+
+        delivered_msg = message_from_bytes(self.fake.delivered)
+        atts = list_attachments(delivered_msg)
+        self.assertEqual(len(atts), 1)
+        name, content = atts[0]
+        self.assertEqual(name, "report.bin")
+        self.assertEqual(content, b"PAYLOAD\x00\xff")
+
+    def test_send_multiple_recipients(self):
+        account = self._make_account(self.fake.port)
+        send_email(account, ["a@x", "b@y", "c@z"], "subj", "msg", Context())
+        self.assertEqual(self.fake.rcpts, ["a@x", "b@y", "c@z"])
+
+    def test_auth_failure_raises_smexception(self):
+        self.fake.stop()  # restart with fail_auth
+        self.fake = _FakeSMTPServer(self.cert_path, self.key_path, fail_auth=True)
+        self.fake.start()
+        account = self._make_account(self.fake.port)
+        with self.assertRaises(SMException) as cm:
+            send_email(account, ["a@b.c"], "s", "m", Context())
+        self.assertIn("Auth error", str(cm.exception))
+
+    def test_wrong_pinned_cert_rejected(self):
+        # Pin a SHA256 that doesn't match — TLS handshake should fail before AUTH.
+        account = self._make_account(self.fake.port)
+        account.pinned_smtp_certificate_sha256 = "0" * 64
+        with self.assertRaises(SMException):
+            send_email(account, ["a@b.c"], "s", "m", Context())
 
 
 if __name__ == "__main__":
