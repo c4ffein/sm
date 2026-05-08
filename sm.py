@@ -695,12 +695,12 @@ def internaldate_key(entry):
         return _EPOCH
 
 
-@raise_smexception_on_connection_error
-def send_email(account_config, recipients, subject, body, ctx: Context, attachment_paths=None):
-    sender_email = account_config.username
+def build_email_message(sender, recipients, subject, body, attachment_paths=None):
+    """Build a MIMEMultipart email message. Pure function — no I/O except reading attachments."""
     message = MIMEMultipart()
-    for k, v in {"From": sender_email, "To": ", ".join(recipients), "Subject": subject}.items():
-        message[k] = v
+    message["From"] = sender
+    message["To"] = ", ".join(recipients)
+    message["Subject"] = subject
     message.attach(MIMEText(body, "plain"))
     if attachment_paths:
         for file_path in attachment_paths:
@@ -712,9 +712,15 @@ def send_email(account_config, recipients, subject, body, ctx: Context, attachme
                 filename = Path(file_path).name
                 part.add_header("Content-Disposition", f"attachment; filename= {filename}")
                 message.attach(part)
-
             except Exception as e:
                 raise SMException(f"Error attaching file {file_path}: {str(e)}") from e
+    return message
+
+
+@raise_smexception_on_connection_error
+def send_email(account_config, recipients, subject, body, ctx: Context, attachment_paths=None):
+    sender_email = account_config.username
+    message = build_email_message(sender_email, recipients, subject, body, attachment_paths)
 
     try:
         ssl_context = make_pinned_ssl_context(
