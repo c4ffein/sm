@@ -40,7 +40,6 @@ from ssl import (
 from sys import argv
 from sys import flags as sys_flags
 from urllib.error import HTTPError
-from uuid import uuid4
 
 CONFIG_PATH = Path.home() / ".config" / "sm" / "config.json"
 LOCK_PATH = Path.home() / ".config" / "sm" / ".lock"
@@ -228,26 +227,38 @@ class MailConnectionInfos:
         return cls(**d)
 
 
-def save_attachment(store_path: Path, msg):
-    for file_name in ["index", "files", "mails"]:
-        (Path(store_path) / file_name).mkdir(mode=0o700, parents=True, exist_ok=True)
-    returned_paths = []
-    att_path = "No attachment found."
+def list_attachments(msg):
+    """Return [(filename, content_bytes)] for every MIME part with a filename. 1-indexed by position."""
+    out = []
     for part in msg.walk():
-        if (part.get_content_maintype() == "multipart") or (part.get("Content-Disposition") is None):
+        if part.get_content_maintype() == "multipart":
             continue
-        filename = part.get_filename() or "UNKNOWN"
-        filename = "".join(c for c in filename.lower().replace(" ", "_") if c in ALLOWED_NAME_CHARS)
-        filename = "".join(str(uuid4()).split("-")[:3]) + "-" + filename
-        att_path = store_path / "files" / filename
-        if not att_path.is_file():
-            content = part.get_payload(decode=True)
-            if not content:
-                continue
-            with att_path.open("wb") as fp:
-                fp.write(content)
-        returned_paths.append(att_path)
-    return returned_paths
+        filename = part.get_filename()
+        if not filename:
+            continue
+        content = part.get_payload(decode=True) or b""
+        out.append((filename, content))
+    return out
+
+
+def save_attachment_bytes(content, dest_dir, suggested_name):
+    """Write content to dest_dir/<sanitized_name>. mkdir -p dest_dir. Rename on collision (_1, _2, ...). Returns Path."""
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = "".join(c if c in ALLOWED_NAME_CHARS else "_" for c in suggested_name) or "attachment"
+    if safe_name.startswith("."):  # no hidden files in the destination — prefix with _, keep the original visible
+        safe_name = "_" + safe_name
+    if safe_name.strip("._") == "":  # all dots/underscores — would resolve to a directory or be visual noise
+        safe_name = "attachment"
+    target = dest_dir / safe_name
+    if target.exists():
+        stem, suffix = Path(safe_name).stem, Path(safe_name).suffix
+        n = 1
+        while (dest_dir / f"{stem}_{n}{suffix}").exists():
+            n += 1
+        target = dest_dir / f"{stem}_{n}{suffix}"
+    target.write_bytes(content)
+    return target
 
 
 @raise_smexception_on_connection_error
@@ -521,11 +532,9 @@ def send_email(account_config, recipients, subject, body, params: Params, attach
             pass
 
 
-def kiss_extract_text_from_eml(eml_path):
-    """Naive text extraction: prefers text/plain, falls back to tag-stripped HTML.
-    HTML handling is intentionally dumb (no entity decoding, no style/script removal) — good enough until it isn't."""
-    with Path(eml_path).open("rb") as f:
-        msg = message_from_bytes(f.read())
+def kiss_extract_text_from_msg(msg):
+    """Naive text extraction from an already-parsed email.message: prefers text/plain, falls back to tag-stripped HTML.
+    HTML handling is intentionally dumb (no entity decoding bugs aside, no style/script removal) — good enough until it isn't."""
     text_parts = []
     html_parts = []
     for part in msg.walk():
@@ -546,6 +555,45 @@ def kiss_extract_text_from_eml(eml_path):
         html = re.sub(r"<[^>]+>", "", html)
         return unescape(html)
     return "(no text content)"
+
+
+def kiss_extract_text_from_eml(eml_path):
+    with Path(eml_path).open("rb") as f:
+        return kiss_extract_text_from_msg(message_from_bytes(f.read()))
+
+
+def _human_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def _save_attachment_action(attachments):
+    """Interactive save flow. Prompts for index (if >1) and destination directory."""
+    if len(attachments) == 1:
+        idx = 1
+    else:
+        try:
+            raw = input(f"  Save which attachment? [1-{len(attachments)}]: ").strip()
+        except EOFError:
+            return
+        if not raw.isdigit() or not (1 <= int(raw) <= len(attachments)):
+            print(f"  Invalid number: {raw}")
+            return
+        idx = int(raw)
+    try:
+        dest = input("  Save to directory [.]: ").strip() or "."
+    except EOFError:
+        return
+    filename, content = attachments[idx - 1]
+    try:
+        target = save_attachment_bytes(content, dest, filename)
+    except OSError as exc:
+        print(f"  Failed to save: {exc}")
+        return
+    print(f"  Saved: {target}")
 
 
 def read_emails(account: MailConnectionInfos):
@@ -616,14 +664,24 @@ def _read_emails_ui(account, store):
                     print(f"  Email file not found: {eml_path}")
                     continue
 
+                with eml_path.open("rb") as f:
+                    msg = message_from_bytes(f.read())
+                attachments = list_attachments(msg)
+
                 print(f"\n{'═' * term_width}")
                 print(f"  From:    {safe_str(entry.get('from', ''), allow_newlines=False)}")
                 print(f"  Date:    {format_date(entry.get('date', ''))}")
                 print(f"  Subject: {safe_str(entry.get('subject', ''), allow_newlines=False)}")
                 print(f"{'═' * term_width}")
-                print(safe_str(kiss_extract_text_from_eml(eml_path), allow_newlines=True))
+                print(safe_str(kiss_extract_text_from_msg(msg), allow_newlines=True))
                 print(f"{'═' * term_width}")
-                print("  [b]ack to list  [q]uit")
+                if attachments:
+                    print("  Attachments:")
+                    for n, (name, content) in enumerate(attachments, 1):
+                        print(f"    {n}. {safe_str(name, allow_newlines=False)} ({_human_size(len(content))})")
+                    print(f"{'═' * term_width}")
+                actions = "  [b]ack to list" + ("  [s]ave attachment" if attachments else "") + "  [q]uit"
+                print(actions)
 
                 try:
                     cmd2 = input("\n> ").strip().lower()
@@ -631,6 +689,8 @@ def _read_emails_ui(account, store):
                     break
                 if cmd2 == "q":
                     break
+                if cmd2 == "s" and attachments:
+                    _save_attachment_action(attachments)
             else:
                 print(f"  Invalid number. Enter 1-{len(entries)}")
         else:

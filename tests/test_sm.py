@@ -16,7 +16,9 @@ from sm import (
     consume_args,
     internaldate_key,
     kiss_extract_text_from_eml,
+    list_attachments,
     safe_str,
+    save_attachment_bytes,
 )
 
 
@@ -366,6 +368,121 @@ class TestKissExtractTextFromEml(unittest.TestCase):
             b"\x00\x01\x02"
         )
         self.assertEqual(kiss_extract_text_from_eml(path), "(no text content)")
+
+
+class TestListAttachments(unittest.TestCase):
+    def test_empty_when_no_attachments(self):
+        msg = EmailMessage()
+        msg.set_content("just a body")
+        self.assertEqual(list_attachments(msg), [])
+
+    def test_returns_filename_and_content(self):
+        msg = EmailMessage()
+        msg.set_content("body")
+        msg.add_attachment(b"hello world", maintype="application", subtype="octet-stream", filename="hi.txt")
+        atts = list_attachments(msg)
+        self.assertEqual(len(atts), 1)
+        name, content = atts[0]
+        self.assertEqual(name, "hi.txt")
+        self.assertEqual(content, b"hello world")
+
+    def test_multiple_attachments_preserve_order(self):
+        msg = EmailMessage()
+        msg.set_content("body")
+        msg.add_attachment(b"first", maintype="application", subtype="octet-stream", filename="a.bin")
+        msg.add_attachment(b"second", maintype="application", subtype="octet-stream", filename="b.bin")
+        atts = list_attachments(msg)
+        self.assertEqual([n for n, _ in atts], ["a.bin", "b.bin"])
+
+    def test_skips_parts_without_filename(self):
+        # Plain text body has no filename; should not appear.
+        msg = EmailMessage()
+        msg.set_content("plain body")
+        msg.add_alternative("<p>html</p>", subtype="html")
+        msg.add_attachment(b"bytes", maintype="application", subtype="pdf", filename="x.pdf")
+        atts = list_attachments(msg)
+        self.assertEqual(len(atts), 1)
+        self.assertEqual(atts[0][0], "x.pdf")
+
+
+class TestSaveAttachmentBytes(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.tmppath = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_writes_file(self):
+        target = save_attachment_bytes(b"payload", self.tmppath, "doc.pdf")
+        self.assertEqual(target, self.tmppath / "doc.pdf")
+        self.assertEqual(target.read_bytes(), b"payload")
+
+    def test_creates_missing_parent_dirs(self):
+        nested = self.tmppath / "a" / "b" / "c"
+        target = save_attachment_bytes(b"x", nested, "f.txt")
+        self.assertTrue(target.exists())
+        self.assertTrue(nested.is_dir())
+
+    def test_collision_appends_suffix(self):
+        save_attachment_bytes(b"first", self.tmppath, "doc.pdf")
+        target = save_attachment_bytes(b"second", self.tmppath, "doc.pdf")
+        self.assertEqual(target.name, "doc_1.pdf")
+        self.assertEqual(target.read_bytes(), b"second")
+        # Original untouched.
+        self.assertEqual((self.tmppath / "doc.pdf").read_bytes(), b"first")
+
+    def test_collision_increments_until_free(self):
+        save_attachment_bytes(b"a", self.tmppath, "x.txt")
+        save_attachment_bytes(b"b", self.tmppath, "x.txt")
+        save_attachment_bytes(b"c", self.tmppath, "x.txt")
+        names = sorted(p.name for p in self.tmppath.iterdir())
+        self.assertEqual(names, ["x.txt", "x_1.txt", "x_2.txt"])
+
+    def test_spaces_become_underscores(self):
+        target = save_attachment_bytes(b"x", self.tmppath, "my invoice.pdf")
+        self.assertEqual(target.name, "my_invoice.pdf")
+
+    def test_path_separators_replaced(self):
+        # Path-traversal attempt: "/" → "_". Leading dot prefixed with "_" (no hidden file in destination).
+        target = save_attachment_bytes(b"x", self.tmppath, "../etc/passwd")
+        self.assertEqual(target.parent, self.tmppath)
+        self.assertEqual(target.name, "_.._etc_passwd")
+        self.assertNotIn("/", target.name)
+
+    def test_disallowed_chars_become_underscore(self):
+        target = save_attachment_bytes(b"x", self.tmppath, "hello@world!.pdf")
+        self.assertEqual(target.name, "hello_world_.pdf")
+
+    def test_leading_dot_gets_underscore_prefix(self):
+        # No hidden files in the destination — original name stays visible.
+        target = save_attachment_bytes(b"x", self.tmppath, ".bashrc")
+        self.assertEqual(target.name, "_.bashrc")
+
+    def test_multiple_leading_dots_get_single_prefix(self):
+        target = save_attachment_bytes(b"x", self.tmppath, "..foo")
+        self.assertEqual(target.name, "_..foo")
+
+    def test_mid_string_dots_preserved(self):
+        target = save_attachment_bytes(b"x", self.tmppath, "archive.tar.gz")
+        self.assertEqual(target.name, "archive.tar.gz")
+
+    def test_dot_only_name_falls_back_to_attachment(self):
+        for raw in ["..", ".", "..."]:
+            with self.subTest(raw=raw):
+                # Fresh dir per case so collision logic doesn't kick in.
+                d = self.tmppath / raw.replace(".", "d")
+                d.mkdir()
+                target = save_attachment_bytes(b"x", d, raw)
+                self.assertEqual(target.name, "attachment")
+
+    def test_all_disallowed_chars_falls_back_to_attachment(self):
+        target = save_attachment_bytes(b"x", self.tmppath, "????")
+        self.assertEqual(target.name, "attachment")
+
+    def test_returns_path_object(self):
+        target = save_attachment_bytes(b"x", self.tmppath, "f.txt")
+        self.assertIsInstance(target, Path)
 
 
 if __name__ == "__main__":
