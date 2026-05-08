@@ -14,6 +14,7 @@ from sm import (
     Store,
     Verbosity,
     consume_args,
+    internaldate_key,
     kiss_extract_text_from_eml,
     safe_str,
 )
@@ -264,6 +265,56 @@ class TestStore(unittest.TestCase):
             store.save_index()
             self.assertFalse((store_path / ".index.json.tmp").exists())
             self.assertTrue((store_path / "index.json").exists())
+
+
+class TestInternaldateKey(unittest.TestCase):
+    def test_parses_imap_format(self):
+        # IMAP INTERNALDATE format: dd-MMM-yyyy HH:MM:SS +zzzz
+        dt = internaldate_key({"internaldate": "08-May-2026 14:30:00 +0000"})
+        self.assertEqual(dt.year, 2026)
+        self.assertEqual(dt.month, 5)
+        self.assertEqual(dt.day, 8)
+        self.assertIsNotNone(dt.tzinfo)
+
+    def test_normalizes_to_aware(self):
+        # Every returned datetime must be tz-aware so sorting can't blow up.
+        for raw in ["08-May-2026 14:30:00 +0000", "08-May-2026 14:30:00 -0500", ""]:
+            with self.subTest(raw=raw):
+                dt = internaldate_key({"internaldate": raw})
+                self.assertIsNotNone(dt.tzinfo)
+
+    def test_missing_internaldate_returns_epoch(self):
+        dt = internaldate_key({})
+        self.assertEqual(dt, sm._EPOCH)
+
+    def test_garbage_internaldate_returns_epoch(self):
+        dt = internaldate_key({"internaldate": "not a date at all"})
+        self.assertEqual(dt, sm._EPOCH)
+
+    def test_does_not_use_date_header(self):
+        # Sort key is internaldate-only — Date: header must be ignored.
+        dt = internaldate_key({"date": "Thu, 8 May 2026 14:30:00 +0000"})
+        self.assertEqual(dt, sm._EPOCH)
+
+    def test_chronological_sort(self):
+        entries = [
+            {"internaldate": "01-Jan-2024 00:00:00 +0000"},
+            {"internaldate": "15-Dec-2025 12:00:00 +0000"},
+            {"internaldate": "08-May-2026 14:30:00 +0000"},
+            {},  # epoch — sorts last when reverse=True (i.e. oldest)
+        ]
+        ordered = sorted(entries, key=internaldate_key, reverse=True)
+        self.assertEqual(ordered[0]["internaldate"], "08-May-2026 14:30:00 +0000")
+        self.assertEqual(ordered[1]["internaldate"], "15-Dec-2025 12:00:00 +0000")
+        self.assertEqual(ordered[2]["internaldate"], "01-Jan-2024 00:00:00 +0000")
+        self.assertEqual(ordered[3], {})
+
+    def test_mixed_timezones_sort_by_instant(self):
+        # 14:00 UTC < 10:00 -0500 (= 15:00 UTC). Sort must respect the instant, not wall-clock.
+        a = {"internaldate": "08-May-2026 14:00:00 +0000"}
+        b = {"internaldate": "08-May-2026 10:00:00 -0500"}
+        ordered = sorted([a, b], key=internaldate_key, reverse=True)
+        self.assertEqual(ordered[0], b)
 
 
 class TestKissExtractTextFromEml(unittest.TestCase):

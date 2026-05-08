@@ -10,6 +10,7 @@ WARNING: I don't recommand using this as-is. This a PoC, and usable by me becaus
 import os
 import re
 from dataclasses import dataclass, fields
+from datetime import datetime, timezone
 from email import encoders, message_from_bytes
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
@@ -461,6 +462,19 @@ def format_date(raw_date):
         return safe_str(raw_date or "", allow_newlines=False)
 
 
+_EPOCH = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def internaldate_key(entry):
+    """Sort key for read_emails: parse INTERNALDATE, normalize to aware UTC, EPOCH on failure."""
+    raw = entry.get("internaldate") or ""
+    try:
+        dt = parsedate_to_datetime(raw)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return _EPOCH
+
+
 @raise_smexception_on_connection_error
 def send_email(account_config, recipients, subject, body, params: Params, attachment_paths=None):
     sender_email = account_config.username
@@ -544,7 +558,7 @@ def _read_emails_ui(account, store):
         raise SMException(f"No emails found for account {account.name}. Run sync first.")
 
     entries = [(h, e) for h, e in store.index.items() if not e.get("deleted")]
-    entries.sort(key=lambda x: x[1].get("date", ""), reverse=True)
+    entries.sort(key=lambda x: internaldate_key(x[1]), reverse=True)
     if not entries:
         raise SMException(f"No non-deleted emails found for account {account.name}.")
 
