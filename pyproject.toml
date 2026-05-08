@@ -4,7 +4,7 @@ version = "0.0.1"
 authors = [
   { name="c4ffein", email="c4ffein@gmail.com" },
 ]
-description = "KISS LLM bridge to your terminal"
+description = "KISS CLI mail client, in Python"
 readme = "README.md"
 requires-python = ">=3.8"
 classifiers = [
