@@ -7,8 +7,10 @@ KISS cli mail client, in Python
 ## Help
 ```
 sm - Simple Mail client
-=======================
-~/.config/sm/init.json => {"accounts": [ACCOUNT_INFOS, ACCOUNT_INFOS, ...]}
+───────────────────────
+~/.config/sm/config.json ──➤ {"accounts": [ACCOUNT_INFOS, ACCOUNT_INFOS, ...], ...}
+  - optional: "default_account_for_send": "account_name"
+  - optional: "ssl_cafile": "/path/to/ca-bundle.crt"  (global default)
   - ACCOUNT_INFOS = {
     "name": "XX"
     "imap_ssl_host": "XX"
@@ -20,9 +22,12 @@ sm - Simple Mail client
     "smtp_ssl_port": 587
     "pinned_smtp_certificate_sha256": "XX"
     "local_store_path": "XX"
-=======================
-- sm send recipient=c4ffein@gmail.com subject=title body=something file=/optional/path ==> send a mail
-- sm backup                                                                            ==> backup everything
-=======================
+    "ssl_cafile": "/optional/override"  (overrides global)
+───────────────────────
+- sm send recipient=a@b.com [recipient=c@d.com ...] subject=title body=something [account=name] [file=path]
+- sm sync [account=name] [yes] [verbose=0|1|2]      ──➤ fetch new + review deletions/moves
+- sm read [account=name]                            ──➤ read emails in terminal
+───────────────────────
+  verbose= accepts 0/1/2 or error/info/debug (applies to all commands)
 You need to generate an app specific password for gmail or other mail clients
 ```
