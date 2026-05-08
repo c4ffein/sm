@@ -7,9 +7,11 @@ WARNING: I don't recommand using this as-is. This a PoC, and usable by me becaus
 - You can use it if you feel that you can edit the code yourself and you can live with my future breaking changes.
 """
 
+import base64
 import os
 import re
-from dataclasses import dataclass, fields
+from collections import namedtuple
+from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from email import encoders, message_from_bytes
 from email.mime.base import MIMEBase
@@ -51,12 +53,29 @@ Verbosity = Enum("Verbosity", [("ERROR", 0), ("INFO", 1), ("DEBUG", 2)])
 
 
 @dataclass
-class Params:
+class Param:
     verbosity: Verbosity = Verbosity.ERROR
 
+
+@dataclass
+class ErrorEvent:
+    kind: str       # "parse_list", "select_failed", "select_error", ...
+    detail: str     # human-readable, sanitized
+    raw: bytes = None  # the original bytes/repr if useful for debug
+
+
+@dataclass
+class Context:
+    """Per-run shared state. `param` = static knobs; `errors` = events accumulated during execution."""
+    param: Param = field(default_factory=Param)
+    errors: list = field(default_factory=list)
+
     def log(self, msg, level=Verbosity.INFO):
-        if level.value <= self.verbosity.value:
+        if level.value <= self.param.verbosity.value:
             print(msg)
+
+    def record_error(self, kind, detail, raw=None):
+        self.errors.append(ErrorEvent(kind=kind, detail=detail, raw=raw))
 
 
 SAFE_PRINT_CHARS = set(
@@ -261,8 +280,191 @@ def save_attachment_bytes(content, dest_dir, suggested_name):
     return target
 
 
+ListEntry = namedtuple("ListEntry", ["flags", "delim", "name", "name_for_select"])
+
+
+# Per RFC 3501 §5.1.3, IMAP mailbox names are 7-bit ASCII (modified UTF-7).
+# Explicit allowlist: every printable ASCII char except '"' and '\\' (would break SELECT quoting).
+# Listed by hand so a reviewer can audit by eye — implicit ranges hide off-by-one bugs.
+_SAFE_FOLDER_CHARS = (
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "abcdefghijklmnopqrstuvwxyz"
+    "0123456789"
+    " !#$%&'()*+,-./:;<=>?@[]^_`{|}~"  # printable punctuation; '"' (0x22) and '\\' (0x5C) intentionally absent
+)
+_SAFE_FOLDER_BYTES = frozenset(ord(c) for c in _SAFE_FOLDER_CHARS)
+
+
+def _is_safe_folder_name(name):
+    """True if `name` is safe to interpolate into f'\"{name}\"' for IMAP commands."""
+    return all(c in _SAFE_FOLDER_CHARS for c in name)
+
+
+def decode_modified_utf7(b):
+    """Decode RFC 3501 §5.1.3 modified UTF-7 bytes to a Python str.
+    Modified base64 uses ',' in place of '/'; payload is unpadded; '&-' encodes a literal '&'.
+    Falls back to ASCII-replace on malformed input rather than raising."""
+    if not isinstance(b, (bytes, bytearray)):
+        return ""
+    out = []
+    i, n = 0, len(b)
+    while i < n:
+        if b[i:i + 1] != b"&":
+            out.append(b[i:i + 1].decode("ascii", "replace"))
+            i += 1
+            continue
+        end = b.find(b"-", i + 1)
+        if end == -1:
+            out.append(b[i:].decode("ascii", "replace"))
+            break
+        payload = b[i + 1:end]
+        if not payload:
+            out.append("&")
+        else:
+            std = payload.replace(b",", b"/")
+            std += b"=" * ((4 - len(std) % 4) % 4)
+            try:
+                out.append(base64.b64decode(std, validate=True).decode("utf-16-be"))
+            except Exception:
+                out.append(b[i:end + 1].decode("ascii", "replace"))
+        i = end + 1
+    return "".join(out)
+
+
+def parse_list_response(item, ctx=None):
+    """Parse one IMAP LIST response item per RFC 3501 §7.2.2.
+
+    Shape: (flags) delim mailbox-name
+      - flags: \\-prefixed atoms separated by spaces
+      - delim: NIL or "<char>" (char may be backslash-escaped)
+      - mailbox-name: quoted, literal ({N}), or atom; modified UTF-7
+
+    item: bytes (single line) or tuple of bytes (line carrying a literal continuation).
+    ctx:  optional Context. If provided, every parse failure records an ErrorEvent
+          (kind="parse_list", detail=specific reason, raw=<original bytes>).
+    Returns ListEntry(flags, delim, name, name_for_select) or None if unparseable.
+      flags           — frozenset[str], e.g. {"\\HasNoChildren"}
+      delim           — single-char str, or None for NIL
+      name            — modified-UTF-7-decoded human-readable str
+      name_for_select — ASCII str safe to send back to the server (keeps modified UTF-7)
+    """
+    if isinstance(item, tuple):
+        raw = b"".join(p for p in item if isinstance(p, (bytes, bytearray)))
+    elif isinstance(item, (bytes, bytearray)):
+        raw = bytes(item)
+    else:
+        raw = repr(item).encode("utf-8", "replace")  # preserve identity for the error event
+    raw = raw.strip()
+
+    def _fail(reason):
+        if ctx is not None:
+            ctx.record_error("parse_list", reason, raw=raw)
+        return None
+
+    if not isinstance(item, (bytes, bytearray, tuple)):
+        return _fail("non-bytes/tuple input")
+
+    n = len(raw)
+    i = 0
+
+    # 1) flag-list: '(' ... ')'
+    if i >= n or raw[i:i + 1] != b"(":
+        return _fail("no opening paren on flag list")
+    i += 1
+    flags_start = i
+    depth = 1
+    while i < n and depth > 0:
+        c = raw[i:i + 1]
+        if c == b"(":
+            depth += 1
+        elif c == b")":
+            depth -= 1
+        i += 1
+    if depth != 0:
+        return _fail("unterminated flag list")
+    flags_bytes = raw[flags_start:i - 1]
+
+    while i < n and raw[i:i + 1] in (b" ", b"\t"):
+        i += 1
+
+    # 2) delim: NIL or "<char>" with optional backslash escape
+    if raw[i:i + 3] == b"NIL":
+        delim = None
+        i += 3
+    elif raw[i:i + 1] == b'"':
+        i += 1
+        if i >= n:
+            return _fail("truncated after opening quote on delimiter")
+        if raw[i:i + 1] == b"\\":
+            i += 1
+            if i >= n:
+                return _fail("truncated after backslash escape in delimiter")
+        delim = raw[i:i + 1].decode("ascii", "replace")
+        i += 1
+        if i >= n or raw[i:i + 1] != b'"':
+            return _fail("missing closing quote on delimiter")
+        i += 1
+    else:
+        return _fail("expected delimiter (NIL or quoted char)")
+
+    while i < n and raw[i:i + 1] in (b" ", b"\t"):
+        i += 1
+    if i >= n:
+        return _fail("missing mailbox name")
+
+    # 3) mailbox-name: quoted, literal, or atom
+    if raw[i:i + 1] == b'"':
+        i += 1
+        chars = bytearray()
+        while i < n and raw[i:i + 1] != b'"':
+            if raw[i:i + 1] == b"\\" and i + 1 < n:
+                chars.append(raw[i + 1])
+                i += 2
+            else:
+                chars.append(raw[i])
+                i += 1
+        if i >= n:
+            return _fail("unterminated quoted mailbox name")
+        name_bytes = bytes(chars)
+    elif raw[i:i + 1] == b"{":
+        end = raw.find(b"}", i)
+        if end == -1:
+            return _fail("malformed literal length marker (no closing brace)")
+        try:
+            count = int(raw[i + 1:end])
+        except ValueError:
+            return _fail("non-numeric literal length")
+        j = end + 1
+        if raw[j:j + 2] == b"\r\n":
+            j += 2
+        elif raw[j:j + 1] in (b"\r", b"\n"):
+            j += 1
+        if j + count > n:
+            return _fail("literal length exceeds available bytes")
+        name_bytes = raw[j:j + count]
+    else:
+        start = i
+        while i < n and raw[i:i + 1] not in (b" ", b"\t", b"\r", b"\n"):
+            i += 1
+        if i == start:
+            return _fail("empty atom mailbox name")
+        name_bytes = raw[start:i]
+
+    # Defense in depth: also rechecked at the SELECT call site in _fetch_all_emails.
+    for byte in name_bytes:
+        if byte not in _SAFE_FOLDER_BYTES:
+            return _fail(f"folder name contains disallowed byte 0x{byte:02x}")
+
+    return ListEntry(
+        flags=frozenset(flags_bytes.decode("ascii", "replace").split()),
+        delim=delim,
+        name=decode_modified_utf7(name_bytes),
+        name_for_select=name_bytes.decode("ascii", "replace"),
+    )
+
+
 @raise_smexception_on_connection_error
-def _fetch_all_emails(account: MailConnectionInfos, store: Store, params: Params):
+def _fetch_all_emails(account: MailConnectionInfos, store: Store, ctx: Context):
     """Core: connect, iterate all folders/UIDs, download new emails, update index.
     Returns (server_state, new_count).
     server_state = {content_hash: [{"folder": ..., "uid": ...}, ...]}
@@ -275,10 +477,10 @@ def _fetch_all_emails(account: MailConnectionInfos, store: Store, params: Params
         status, folder_data = mail.list()
         folders = []
         for item in folder_data:
-            if isinstance(item, bytes):
-                parts = item.decode().rsplit('" "', 1)
-                if len(parts) == 2:
-                    folders.append(parts[1].rstrip('"'))
+            entry = parse_list_response(item, ctx)
+            if entry is None:
+                continue  # specific reason already recorded on ctx by parse_list_response
+            folders.append(entry.name_for_select)  # raw form: stable identity for SELECT and index storage
         if not folders:
             raise SMException(f"No folders found. Raw response: {folder_data[:3]}...")
 
@@ -297,14 +499,20 @@ def _fetch_all_emails(account: MailConnectionInfos, store: Store, params: Params
         new_count = 0
 
         for folder in folders:
+            # Defense in depth: also gated at parse_list_response. If this fires, something bypassed the parser.
+            if not _is_safe_folder_name(folder):
+                ctx.log(f"Skipping unsafe folder name: {safe_str(folder, allow_newlines=False)}", Verbosity.DEBUG)
+                ctx.record_error("unsafe_folder_name", f"folder {folder!r} contains disallowed bytes; refusing to SELECT")
+                continue
             try:
                 status, messages = mail.select(f'"{folder}"')
                 if status != "OK":
-                    params.log(f"Skipping folder (select failed): {safe_str(folder, allow_newlines=False)}", Verbosity.DEBUG)
-                    continue  # TODO: collect into structured warnings to surface in sync summary
-            except Exception:
-                params.log(f"Skipping folder: {safe_str(folder, allow_newlines=False)}", Verbosity.DEBUG)
-                # TODO: collect into structured warnings to surface in sync summary
+                    ctx.log(f"Skipping folder (select failed): {safe_str(folder, allow_newlines=False)}", Verbosity.DEBUG)
+                    ctx.record_error("select_failed", f"SELECT returned {status} for folder {folder!r}")
+                    continue
+            except Exception as exc:
+                ctx.log(f"Skipping folder: {safe_str(folder, allow_newlines=False)}", Verbosity.DEBUG)
+                ctx.record_error("select_error", f"SELECT raised {type(exc).__name__} for folder {folder!r}: {exc}")
                 continue
 
             result, data = mail.uid("SEARCH", None, "ALL")
@@ -375,7 +583,7 @@ def _fetch_all_emails(account: MailConnectionInfos, store: Store, params: Params
                         }
                         store.save_index()
                         new_count += 1
-                        params.log(f"Fetched: {safe_str(email_data.get('Subject', '(no subject)')[:50], allow_newlines=False)}", Verbosity.DEBUG)
+                        ctx.log(f"Fetched: {safe_str(email_data.get('Subject', '(no subject)')[:50], allow_newlines=False)}", Verbosity.DEBUG)
                 print(f"\r    {i}/{len(uids)}", end="", flush=True)
             if uids:
                 print()
@@ -385,16 +593,16 @@ def _fetch_all_emails(account: MailConnectionInfos, store: Store, params: Params
         mail.logout()
 
 
-def sync_emails(account: MailConnectionInfos, params: Params, auto_apply=False):
+def sync_emails(account: MailConnectionInfos, ctx: Context, auto_apply=False):
     """Sync local state with remote: fetch new emails, then detect deletions and moves with user review."""
     with Store(account.local_store_path) as store:
-        server_state, new_count = _fetch_all_emails(account, store, params)
-        _sync_apply(account, store, server_state, new_count, auto_apply, params)
+        server_state, new_count = _fetch_all_emails(account, store, ctx)
+        _sync_apply(account, store, server_state, new_count, auto_apply, ctx)
 
 
-def _sync_apply(account, store, server_state, new_count, auto_apply, params):
+def _sync_apply(account, store, server_state, new_count, auto_apply, ctx):
     if new_count:
-        params.log(f"  Fetched {new_count} new email(s)", Verbosity.INFO)
+        ctx.log(f"  Fetched {new_count} new email(s)", Verbosity.INFO)
 
     changelog = []
     for content_hash, entry in store.index.items():
@@ -414,7 +622,7 @@ def _sync_apply(account, store, server_state, new_count, auto_apply, params):
                 changelog.append(("M", content_hash, f"{subj}  ({desc})", entry))
 
     if not changelog:
-        params.log(f"\nSync complete for {account.name}: {new_count} new, no server-side changes detected.", Verbosity.INFO)
+        ctx.log(f"\nSync complete for {account.name}: {new_count} new, no server-side changes detected.", Verbosity.INFO)
         return
 
     try:
@@ -443,7 +651,7 @@ def _sync_apply(account, store, server_state, new_count, auto_apply, params):
         apply = cmd in ("y", "yes")
 
     if not apply:
-        params.log("  Server-side changes discarded (newly fetched emails are still saved).", Verbosity.INFO)
+        ctx.log("  Server-side changes discarded (newly fetched emails are still saved).", Verbosity.INFO)
         store.save_index()
         return
 
@@ -461,7 +669,8 @@ def _sync_apply(account, store, server_state, new_count, auto_apply, params):
                     h["removed"] = True
 
     store.save_index()
-    params.log(f"  Applied: {len(deletions)} deletion(s), {len(moves)} move(s).", Verbosity.INFO)
+    ctx.log(f"  Applied: {len(deletions)} deletion(s), {len(moves)} move(s).", Verbosity.INFO)
+    # TODO: surface ctx.errors here — e.g. "N folders skipped (run with verbose=2 for details)" grouped by ErrorEvent.kind.
 
 
 
@@ -487,7 +696,7 @@ def internaldate_key(entry):
 
 
 @raise_smexception_on_connection_error
-def send_email(account_config, recipients, subject, body, params: Params, attachment_paths=None):
+def send_email(account_config, recipients, subject, body, ctx: Context, attachment_paths=None):
     sender_email = account_config.username
     message = MIMEMultipart()
     for k, v in {"From": sender_email, "To": ", ".join(recipients), "Subject": subject}.items():
@@ -520,7 +729,7 @@ def send_email(account_config, recipients, subject, body, params: Params, attach
         server.login(sender_email, account_config.password)
         text = message.as_string()
         server.sendmail(sender_email, recipients, text)
-        params.log("Email sent successfully!", Verbosity.INFO)
+        ctx.log("Email sent successfully!", Verbosity.INFO)
     except SMTPAuthenticationError as exc:
         raise SMException(f"Auth error:\n{str(exc)}") from exc
     except Exception as exc:
@@ -732,29 +941,29 @@ def usage(wrong_config=False, wrong_command=False):
 
 def consume_args(argv):
     if len(argv) < 2 or argv[1] not in ["send", "sync", "read"]:
-        return None, Params()
+        return None, Context()
     remaining = [v for v in argv[2:] if not v.startswith("verbose=")]
     verbose_args = [v for v in argv[2:] if v.startswith("verbose=")]
-    params = Params()
+    ctx = Context()
     if verbose_args:
         val = verbose_args[-1].split("=", 1)[1].lower()
         mapping = {"0": "ERROR", "1": "INFO", "2": "DEBUG", "error": "ERROR", "info": "INFO", "debug": "DEBUG"}
         if val not in mapping:
             raise SMException(f"Invalid verbose level: {val} (use 0/1/2 or error/info/debug)")
-        params.verbosity = Verbosity[mapping[val]]
+        ctx.param.verbosity = Verbosity[mapping[val]]
     if argv[1] == "sync":
         account = next((v[v.index("=") + 1 :] for v in remaining if v.startswith("account=")), None)
         auto_apply = "yes" in remaining
         invalid = [v for v in remaining if not v.startswith("account=") and v != "yes"]
         if invalid:
             raise SMException(f"Invalid options for sync: {'  ;  '.join(invalid)}")
-        return {"action": "sync", "account": account, "auto_apply": auto_apply}, params
+        return {"action": "sync", "account": account, "auto_apply": auto_apply}, ctx
     if argv[1] == "read":
         account = next((v[v.index("=") + 1 :] for v in remaining if v.startswith("account=")), None)
         invalid = [v for v in remaining if not v.startswith("account=")]
         if invalid:
             raise SMException(f"Invalid options for read: {'  ;  '.join(invalid)}")
-        return {"action": "read", "account": account}, params
+        return {"action": "read", "account": account}, ctx
     # send
     allowed_opts = ["recipient", "subject", "body", "file", "account"]
     mandatory_opts = ["subject", "body"]
@@ -771,7 +980,7 @@ def consume_args(argv):
         raise SMException("Missing options for send: recipient")
     opts["files"] = [v[v.index("=") + 1 :] for v in remaining if v.startswith("file=")]
     opts.setdefault("account", None)
-    return {**opts, "action": "send"}, params
+    return {**opts, "action": "send"}, ctx
 
 
 def resolve_accounts(mail_connections_infos, account_name):
@@ -802,7 +1011,7 @@ def main():
     account_names = [m.name for m in mail_connections_infos]
     if len(account_names) != len(set(account_names)):
         raise SMException("Duplicate account names in config")
-    args, params = consume_args(argv)
+    args, ctx = consume_args(argv)
     if not args:
         return usage()
     if args["action"] == "send":
@@ -811,11 +1020,11 @@ def main():
             raise SMException("No account specified and no default_account_for_send in config")
         send_email(
             resolve_accounts(mail_connections_infos, account_name)[0],
-            args["recipients"], args["subject"], args["body"], params, args["files"],
+            args["recipients"], args["subject"], args["body"], ctx, args["files"],
         )
     elif args["action"] == "sync":
         for account in resolve_accounts(mail_connections_infos, args["account"]):
-            sync_emails(account, params, auto_apply=args["auto_apply"])
+            sync_emails(account, ctx, auto_apply=args["auto_apply"])
     elif args["action"] == "read":
         accounts = resolve_accounts(mail_connections_infos, args["account"])
         if len(accounts) == 1:

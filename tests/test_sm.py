@@ -8,64 +8,101 @@ from pathlib import Path
 
 import sm
 from sm import (
+    Context,
+    ErrorEvent,
     MailConnectionInfos,
-    Params,
+    Param,
     SMException,
     Store,
     Verbosity,
+    _is_safe_folder_name,
     consume_args,
+    decode_modified_utf7,
     internaldate_key,
     kiss_extract_text_from_eml,
     list_attachments,
+    parse_list_response,
     safe_str,
     save_attachment_bytes,
 )
 
 
-class TestParams(unittest.TestCase):
+class TestParam(unittest.TestCase):
     def test_default_verbosity_is_error(self):
-        self.assertEqual(Params().verbosity, Verbosity.ERROR)
+        self.assertEqual(Param().verbosity, Verbosity.ERROR)
+
+
+class TestContext(unittest.TestCase):
+    def test_default_param_and_errors(self):
+        c = Context()
+        self.assertEqual(c.param.verbosity, Verbosity.ERROR)
+        self.assertEqual(c.errors, [])
 
     def test_log_at_or_below_verbosity_prints(self):
-        p = Params(verbosity=Verbosity.DEBUG)
+        c = Context(param=Param(verbosity=Verbosity.DEBUG))
         buf = io.StringIO()
         with redirect_stdout(buf):
-            p.log("info msg", Verbosity.INFO)
-            p.log("debug msg", Verbosity.DEBUG)
+            c.log("info msg", Verbosity.INFO)
+            c.log("debug msg", Verbosity.DEBUG)
         out = buf.getvalue()
         self.assertIn("info msg", out)
         self.assertIn("debug msg", out)
 
     def test_log_above_verbosity_silent(self):
-        p = Params(verbosity=Verbosity.ERROR)
+        c = Context(param=Param(verbosity=Verbosity.ERROR))
         buf = io.StringIO()
         with redirect_stdout(buf):
-            p.log("info msg", Verbosity.INFO)
-            p.log("debug msg", Verbosity.DEBUG)
+            c.log("info msg", Verbosity.INFO)
+            c.log("debug msg", Verbosity.DEBUG)
         self.assertEqual(buf.getvalue(), "")
 
     def test_log_default_level_is_info(self):
-        p = Params(verbosity=Verbosity.ERROR)
+        c = Context(param=Param(verbosity=Verbosity.ERROR))
         buf = io.StringIO()
         with redirect_stdout(buf):
-            p.log("hello")
+            c.log("hello")
         self.assertEqual(buf.getvalue(), "")  # ERROR < INFO, silent
+
+    def test_record_error_appends(self):
+        c = Context()
+        c.record_error("parse_list", "bogus item")
+        self.assertEqual(len(c.errors), 1)
+        self.assertEqual(c.errors[0], ErrorEvent(kind="parse_list", detail="bogus item", raw=None))
+
+    def test_record_error_carries_raw(self):
+        c = Context()
+        c.record_error("select_failed", "SELECT returned NO", raw=b"some raw bytes")
+        self.assertEqual(c.errors[0].raw, b"some raw bytes")
+
+    def test_record_error_accumulates(self):
+        c = Context()
+        c.record_error("parse_list", "first")
+        c.record_error("select_failed", "second")
+        c.record_error("parse_list", "third")
+        self.assertEqual([e.kind for e in c.errors], ["parse_list", "select_failed", "parse_list"])
+
+    def test_separate_contexts_are_isolated(self):
+        # field(default_factory=list) — each Context gets its own list, not a shared default.
+        a = Context()
+        b = Context()
+        a.record_error("x", "to a")
+        self.assertEqual(b.errors, [])
 
 
 class TestConsumeArgs(unittest.TestCase):
     def test_empty_argv(self):
-        action, params = consume_args(["sm"])
+        action, ctx = consume_args(["sm"])
         self.assertIsNone(action)
-        self.assertEqual(params.verbosity, Verbosity.ERROR)
+        self.assertEqual(ctx.param.verbosity, Verbosity.ERROR)
 
     def test_unknown_command(self):
         action, _ = consume_args(["sm", "fubar"])
         self.assertIsNone(action)
 
     def test_sync_minimal(self):
-        action, params = consume_args(["sm", "sync"])
+        action, ctx = consume_args(["sm", "sync"])
         self.assertEqual(action, {"action": "sync", "account": None, "auto_apply": False})
-        self.assertEqual(params.verbosity, Verbosity.ERROR)
+        self.assertEqual(ctx.param.verbosity, Verbosity.ERROR)
 
     def test_sync_with_account_and_yes(self):
         action, _ = consume_args(["sm", "sync", "account=foo", "yes"])
@@ -79,8 +116,8 @@ class TestConsumeArgs(unittest.TestCase):
     def test_verbose_numeric(self):
         for raw, level in [("0", Verbosity.ERROR), ("1", Verbosity.INFO), ("2", Verbosity.DEBUG)]:
             with self.subTest(raw=raw):
-                _, params = consume_args(["sm", "sync", f"verbose={raw}"])
-                self.assertEqual(params.verbosity, level)
+                _, ctx = consume_args(["sm", "sync", f"verbose={raw}"])
+                self.assertEqual(ctx.param.verbosity, level)
 
     def test_verbose_named(self):
         for raw, level in [
@@ -90,16 +127,16 @@ class TestConsumeArgs(unittest.TestCase):
             ("DEBUG", Verbosity.DEBUG),  # case-insensitive
         ]:
             with self.subTest(raw=raw):
-                _, params = consume_args(["sm", "sync", f"verbose={raw}"])
-                self.assertEqual(params.verbosity, level)
+                _, ctx = consume_args(["sm", "sync", f"verbose={raw}"])
+                self.assertEqual(ctx.param.verbosity, level)
 
     def test_verbose_invalid(self):
         with self.assertRaises(SMException):
             consume_args(["sm", "sync", "verbose=loud"])
 
     def test_verbose_last_wins(self):
-        _, params = consume_args(["sm", "sync", "verbose=0", "verbose=2"])
-        self.assertEqual(params.verbosity, Verbosity.DEBUG)
+        _, ctx = consume_args(["sm", "sync", "verbose=0", "verbose=2"])
+        self.assertEqual(ctx.param.verbosity, Verbosity.DEBUG)
 
     def test_read_minimal(self):
         action, _ = consume_args(["sm", "read"])
@@ -483,6 +520,221 @@ class TestSaveAttachmentBytes(unittest.TestCase):
     def test_returns_path_object(self):
         target = save_attachment_bytes(b"x", self.tmppath, "f.txt")
         self.assertIsInstance(target, Path)
+
+
+class TestDecodeModifiedUTF7(unittest.TestCase):
+    def test_pure_ascii_passthrough(self):
+        self.assertEqual(decode_modified_utf7(b"INBOX"), "INBOX")
+        self.assertEqual(decode_modified_utf7(b"[Gmail]/Sent Mail"), "[Gmail]/Sent Mail")
+
+    def test_empty(self):
+        self.assertEqual(decode_modified_utf7(b""), "")
+
+    def test_literal_ampersand(self):
+        # &- encodes a literal "&"
+        self.assertEqual(decode_modified_utf7(b"&-"), "&")
+        self.assertEqual(decode_modified_utf7(b"M&-M"), "M&M")
+
+    def test_single_non_ascii_char(self):
+        # ä = U+00E4 → UTF-16BE 00 E4 → base64 "AOQ" → wrapped "&AOQ-"
+        self.assertEqual(decode_modified_utf7(b"&AOQ-"), "ä")
+
+    def test_word_with_non_ascii(self):
+        # é = U+00E9 → "AOk"
+        self.assertEqual(decode_modified_utf7(b"Caf&AOk-"), "Café")
+
+    def test_multiple_codepoints_in_one_escape(self):
+        # 日本 = U+65E5 U+672C → UTF-16BE 65 E5 67 2C → base64 "ZeVnLA"
+        # (ZeU = 65 E5; ZeVnLA = 65 E5 67 2C)
+        self.assertEqual(decode_modified_utf7(b"&ZeVnLA-"), "日本")
+
+    def test_modified_base64_uses_comma_for_slash(self):
+        # U+FF00 → UTF-16BE FF 00 → standard base64 "/wA" → modified ",wA"
+        self.assertEqual(decode_modified_utf7(b"&,wA-"), "＀")
+
+    def test_unterminated_escape_falls_back_literal(self):
+        # No closing '-' — emit verbatim, do not raise.
+        self.assertEqual(decode_modified_utf7(b"&AOQ"), "&AOQ")
+
+    def test_malformed_base64_falls_back_literal(self):
+        # Garbage payload — emit verbatim.
+        self.assertEqual(decode_modified_utf7(b"&!!!-"), "&!!!-")
+
+    def test_non_bytes_returns_empty(self):
+        self.assertEqual(decode_modified_utf7("INBOX"), "")
+        self.assertEqual(decode_modified_utf7(None), "")
+
+
+class TestParseListResponse(unittest.TestCase):
+    def test_standard_quoted(self):
+        entry = parse_list_response(b'(\\HasNoChildren) "/" "INBOX"')
+        self.assertEqual(entry.flags, frozenset({"\\HasNoChildren"}))
+        self.assertEqual(entry.delim, "/")
+        self.assertEqual(entry.name, "INBOX")
+        self.assertEqual(entry.name_for_select, "INBOX")
+
+    def test_multiple_flags(self):
+        entry = parse_list_response(b'(\\Noselect \\HasChildren) "/" "[Gmail]"')
+        self.assertEqual(entry.flags, frozenset({"\\Noselect", "\\HasChildren"}))
+        self.assertEqual(entry.name, "[Gmail]")
+
+    def test_empty_flags(self):
+        entry = parse_list_response(b'() "/" "Foo"')
+        self.assertEqual(entry.flags, frozenset())
+
+    def test_nil_delimiter(self):
+        entry = parse_list_response(b'() NIL "Trash"')
+        self.assertIsNone(entry.delim)
+        self.assertEqual(entry.name, "Trash")
+
+    def test_atom_mailbox_name(self):
+        # Unquoted (atom) form — legal per spec.
+        entry = parse_list_response(b'() "/" INBOX')
+        self.assertEqual(entry.name, "INBOX")
+        self.assertEqual(entry.name_for_select, "INBOX")
+
+    def test_quoted_name_with_spaces(self):
+        entry = parse_list_response(b'() "/" "Sent Items"')
+        self.assertEqual(entry.name, "Sent Items")
+
+    def test_modified_utf7_name(self):
+        entry = parse_list_response(b'() "/" "Caf&AOk-"')
+        self.assertEqual(entry.name, "Café")
+        # name_for_select retains the wire form so SELECT round-trips unchanged.
+        self.assertEqual(entry.name_for_select, "Caf&AOk-")
+
+    def test_escaped_quote_in_name_now_rejected(self):
+        # Pre-safety-check this returned a ListEntry with name='weird"name'. Now the parser
+        # refuses any name byte that would break SELECT quoting.
+        ctx = Context()
+        self.assertIsNone(parse_list_response(b'() "/" "weird\\"name"', ctx))
+        self.assertIn("disallowed byte 0x22", ctx.errors[0].detail)
+
+    def test_escaped_delim(self):
+        # Backslash-escaped delimiter char.
+        entry = parse_list_response(b'() "\\\\" "Foo"')
+        self.assertEqual(entry.delim, "\\")
+        self.assertEqual(entry.name, "Foo")
+
+    def test_literal_form_as_tuple(self):
+        # imaplib delivers literals as a tuple: (header_with_{N}, literal_bytes).
+        entry = parse_list_response((b'(\\HasNoChildren) "/" {7}', b"INBOX/x"))
+        self.assertEqual(entry.name, "INBOX/x")
+        self.assertEqual(entry.name_for_select, "INBOX/x")
+
+    def test_literal_with_crlf_between_marker_and_bytes(self):
+        # Some servers/parsers leave the CRLF between the {N} marker and the literal bytes.
+        entry = parse_list_response(b'(\\HasNoChildren) "/" {7}\r\nINBOX/y')
+        self.assertEqual(entry.name, "INBOX/y")
+
+    def test_literal_with_modified_utf7(self):
+        # Literal carrying a non-ASCII (mod-UTF-7) name.
+        entry = parse_list_response((b'() "/" {8}', b"Caf&AOk-"))
+        self.assertEqual(entry.name, "Café")
+        self.assertEqual(entry.name_for_select, "Caf&AOk-")
+
+    def test_garbage_returns_none(self):
+        for raw in [b"totally bogus", b"(no closing", b"", b"() not_a_delim INBOX"]:
+            with self.subTest(raw=raw):
+                self.assertIsNone(parse_list_response(raw))
+
+    def test_non_bytes_input_returns_none(self):
+        self.assertIsNone(parse_list_response("string instead of bytes"))
+        self.assertIsNone(parse_list_response(None))
+        self.assertIsNone(parse_list_response(42))
+
+    def test_failures_record_specific_reasons_on_ctx(self):
+        # Each failure mode tags the ErrorEvent.detail with a distinct reason.
+        cases = [
+            (b"totally bogus",            "no opening paren"),
+            (b"(no closing",              "unterminated flag list"),
+            (b"() not_a_delim INBOX",     "expected delimiter"),
+            (b"() NIL",                   "missing mailbox name"),
+            (b'() "/" "unterminated',     "unterminated quoted mailbox name"),
+            (b'() "/" {abc}',             "non-numeric literal length"),
+            (b'() "/" {99}\r\nshort',     "literal length exceeds available bytes"),
+            (b'() "/" {bogus',            "malformed literal length marker"),
+        ]
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                ctx = Context()
+                self.assertIsNone(parse_list_response(raw, ctx))
+                self.assertEqual(len(ctx.errors), 1)
+                self.assertEqual(ctx.errors[0].kind, "parse_list")
+                self.assertIn(expected, ctx.errors[0].detail)
+                self.assertEqual(ctx.errors[0].raw, raw.strip())
+
+    def test_non_bytes_input_records_with_repr(self):
+        ctx = Context()
+        self.assertIsNone(parse_list_response(42, ctx))
+        self.assertEqual(ctx.errors[0].kind, "parse_list")
+        self.assertIn("non-bytes/tuple", ctx.errors[0].detail)
+        # raw stores a repr() of the bad input so future-you can identify what came in.
+        self.assertEqual(ctx.errors[0].raw, b"42")
+
+    def test_success_does_not_touch_ctx(self):
+        ctx = Context()
+        entry = parse_list_response(b'(\\HasNoChildren) "/" "INBOX"', ctx)
+        self.assertIsNotNone(entry)
+        self.assertEqual(ctx.errors, [])
+
+    def test_ctx_optional_default_none(self):
+        # Backward compat: existing call sites that don't pass ctx still get None on garbage.
+        self.assertIsNone(parse_list_response(b"garbage"))
+        # And no record is attempted (would AttributeError if ctx were used unconditionally).
+
+    def test_rejects_name_with_unsafe_byte(self):
+        # Literal form lets a hostile/buggy server send a name with bytes that would break
+        # SELECT quoting. Parser refuses with a byte-specific reason.
+        # Trailing 'X' protects the literal bytes from raw.strip().
+        # 7 bytes: I N B O X \r X
+        ctx = Context()
+        self.assertIsNone(parse_list_response(b'() "/" {7}\r\nINBOX\rX', ctx))
+        self.assertEqual(ctx.errors[0].kind, "parse_list")
+        self.assertIn("disallowed byte 0x0d", ctx.errors[0].detail)  # CR
+
+    def test_rejects_name_with_quote_byte(self):
+        # Backslash-escaped quote is unescaped into the name bytes — would break f'"{name}"'.
+        ctx = Context()
+        self.assertIsNone(parse_list_response(b'() "/" "evil\\"name"', ctx))
+        self.assertIn("disallowed byte 0x22", ctx.errors[0].detail)  # "
+
+    def test_rejects_name_with_high_bit(self):
+        # Modified UTF-7 names are pure ASCII per spec; high-bit byte must be refused.
+        ctx = Context()
+        self.assertIsNone(parse_list_response(b'() "/" {1}\r\n\xff', ctx))
+        self.assertIn("disallowed byte 0xff", ctx.errors[0].detail)
+
+
+class TestIsSafeFolderName(unittest.TestCase):
+    def test_accepts_typical_names(self):
+        for name in ["INBOX", "[Gmail]/All Mail", "Sent Items", "Receipts/Caf&AOk-", "a-b_c.d"]:
+            with self.subTest(name=name):
+                self.assertTrue(_is_safe_folder_name(name))
+
+    def test_rejects_quote(self):
+        self.assertFalse(_is_safe_folder_name('evil"name'))
+
+    def test_rejects_backslash(self):
+        self.assertFalse(_is_safe_folder_name("evil\\name"))
+
+    def test_rejects_cr_lf(self):
+        self.assertFalse(_is_safe_folder_name("INBOX\r\n"))
+        self.assertFalse(_is_safe_folder_name("INBOX\nA1 DELETE INBOX"))
+
+    def test_rejects_control_chars(self):
+        for c in ("\x00", "\x07", "\x1b", "\x7f"):
+            with self.subTest(c=repr(c)):
+                self.assertFalse(_is_safe_folder_name(f"a{c}b"))
+
+    def test_rejects_high_bit(self):
+        # Even legitimate UTF-8 chars are out — names on the wire must be modified UTF-7 (ASCII only).
+        self.assertFalse(_is_safe_folder_name("Café"))
+
+    def test_empty_is_safe(self):
+        # Empty string passes the per-byte check (no bytes to fail on). The parser rejects empty
+        # atom names separately; this predicate is purely about character safety.
+        self.assertTrue(_is_safe_folder_name(""))
 
 
 if __name__ == "__main__":
