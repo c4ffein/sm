@@ -48,12 +48,15 @@ colors = {"RED": "31", "GREEN": "32", "PURP": "34", "DIM": "90", "WHITE": "39"}
 Color = Enum("Color", [(k, f"\033[{v}m") for k, v in colors.items()])
 
 Verbosity = Enum("Verbosity", [("ERROR", 0), ("INFO", 1), ("DEBUG", 2)])
-_verbosity = Verbosity.ERROR
 
 
-def log(msg, level=Verbosity.INFO):
-    if level.value <= _verbosity.value:
-        print(msg)
+@dataclass
+class Params:
+    verbosity: Verbosity = Verbosity.ERROR
+
+    def log(self, msg, level=Verbosity.INFO):
+        if level.value <= self.verbosity.value:
+            print(msg)
 
 
 SAFE_PRINT_CHARS = set(
@@ -247,7 +250,7 @@ def save_attachment(store_path: Path, msg):
 
 
 @raise_smexception_on_connection_error
-def _fetch_all_emails(account: MailConnectionInfos, store: Store):
+def _fetch_all_emails(account: MailConnectionInfos, store: Store, params: Params):
     """Core: connect, iterate all folders/UIDs, download new emails, update index.
     Returns (server_state, new_count).
     server_state = {content_hash: [{"folder": ..., "uid": ...}, ...]}
@@ -285,10 +288,10 @@ def _fetch_all_emails(account: MailConnectionInfos, store: Store):
             try:
                 status, messages = mail.select(f'"{folder}"')
                 if status != "OK":
-                    log(f"Skipping folder (select failed): {safe_str(folder, allow_newlines=False)}", Verbosity.DEBUG)
+                    params.log(f"Skipping folder (select failed): {safe_str(folder, allow_newlines=False)}", Verbosity.DEBUG)
                     continue  # TODO: collect into structured warnings to surface in sync summary
             except Exception:
-                log(f"Skipping folder: {safe_str(folder, allow_newlines=False)}", Verbosity.DEBUG)
+                params.log(f"Skipping folder: {safe_str(folder, allow_newlines=False)}", Verbosity.DEBUG)
                 # TODO: collect into structured warnings to surface in sync summary
                 continue
 
@@ -360,7 +363,7 @@ def _fetch_all_emails(account: MailConnectionInfos, store: Store):
                         }
                         store.save_index()
                         new_count += 1
-                        log(f"Fetched: {safe_str(email_data.get('Subject', '(no subject)')[:50], allow_newlines=False)}", Verbosity.DEBUG)
+                        params.log(f"Fetched: {safe_str(email_data.get('Subject', '(no subject)')[:50], allow_newlines=False)}", Verbosity.DEBUG)
                 print(f"\r    {i}/{len(uids)}", end="", flush=True)
             if uids:
                 print()
@@ -370,16 +373,16 @@ def _fetch_all_emails(account: MailConnectionInfos, store: Store):
         mail.logout()
 
 
-def sync_emails(account: MailConnectionInfos, auto_apply=False):
+def sync_emails(account: MailConnectionInfos, params: Params, auto_apply=False):
     """Sync local state with remote: fetch new emails, then detect deletions and moves with user review."""
     with Store(account.local_store_path) as store:
-        server_state, new_count = _fetch_all_emails(account, store)
-        _sync_apply(account, store, server_state, new_count, auto_apply)
+        server_state, new_count = _fetch_all_emails(account, store, params)
+        _sync_apply(account, store, server_state, new_count, auto_apply, params)
 
 
-def _sync_apply(account, store, server_state, new_count, auto_apply):
+def _sync_apply(account, store, server_state, new_count, auto_apply, params):
     if new_count:
-        log(f"  Fetched {new_count} new email(s)", Verbosity.INFO)
+        params.log(f"  Fetched {new_count} new email(s)", Verbosity.INFO)
 
     changelog = []
     for content_hash, entry in store.index.items():
@@ -399,7 +402,7 @@ def _sync_apply(account, store, server_state, new_count, auto_apply):
                 changelog.append(("M", content_hash, f"{subj}  ({desc})", entry))
 
     if not changelog:
-        log(f"\nSync complete for {account.name}: {new_count} new, no server-side changes detected.", Verbosity.INFO)
+        params.log(f"\nSync complete for {account.name}: {new_count} new, no server-side changes detected.", Verbosity.INFO)
         return
 
     try:
@@ -428,7 +431,7 @@ def _sync_apply(account, store, server_state, new_count, auto_apply):
         apply = cmd in ("y", "yes")
 
     if not apply:
-        log("  Server-side changes discarded (newly fetched emails are still saved).", Verbosity.INFO)
+        params.log("  Server-side changes discarded (newly fetched emails are still saved).", Verbosity.INFO)
         store.save_index()
         return
 
@@ -446,7 +449,7 @@ def _sync_apply(account, store, server_state, new_count, auto_apply):
                     h["removed"] = True
 
     store.save_index()
-    log(f"  Applied: {len(deletions)} deletion(s), {len(moves)} move(s).", Verbosity.INFO)
+    params.log(f"  Applied: {len(deletions)} deletion(s), {len(moves)} move(s).", Verbosity.INFO)
 
 
 
@@ -459,7 +462,7 @@ def format_date(raw_date):
 
 
 @raise_smexception_on_connection_error
-def send_email(account_config, recipients, subject, body, attachment_paths=None):
+def send_email(account_config, recipients, subject, body, params: Params, attachment_paths=None):
     sender_email = account_config.username
     message = MIMEMultipart()
     for k, v in {"From": sender_email, "To": ", ".join(recipients), "Subject": subject}.items():
@@ -492,7 +495,7 @@ def send_email(account_config, recipients, subject, body, attachment_paths=None)
         server.login(sender_email, account_config.password)
         text = message.as_string()
         server.sendmail(sender_email, recipients, text)
-        log("Email sent successfully!", Verbosity.INFO)
+        params.log("Email sent successfully!", Verbosity.INFO)
     except SMTPAuthenticationError as exc:
         raise SMException(f"Auth error:\n{str(exc)}") from exc
     except Exception as exc:
@@ -653,31 +656,31 @@ def usage(wrong_config=False, wrong_command=False):
     return -1
 
 
-def consume_args():
+def consume_args(argv):
     if len(argv) < 2 or argv[1] not in ["send", "sync", "read"]:
-        return None
+        return None, Params()
     remaining = [v for v in argv[2:] if not v.startswith("verbose=")]
     verbose_args = [v for v in argv[2:] if v.startswith("verbose=")]
+    params = Params()
     if verbose_args:
         val = verbose_args[-1].split("=", 1)[1].lower()
         mapping = {"0": "ERROR", "1": "INFO", "2": "DEBUG", "error": "ERROR", "info": "INFO", "debug": "DEBUG"}
         if val not in mapping:
             raise SMException(f"Invalid verbose level: {val} (use 0/1/2 or error/info/debug)")
-        global _verbosity
-        _verbosity = Verbosity[mapping[val]]
+        params.verbosity = Verbosity[mapping[val]]
     if argv[1] == "sync":
         account = next((v[v.index("=") + 1 :] for v in remaining if v.startswith("account=")), None)
         auto_apply = "yes" in remaining
         invalid = [v for v in remaining if not v.startswith("account=") and v != "yes"]
         if invalid:
             raise SMException(f"Invalid options for sync: {'  ;  '.join(invalid)}")
-        return {"action": "sync", "account": account, "auto_apply": auto_apply}
+        return {"action": "sync", "account": account, "auto_apply": auto_apply}, params
     if argv[1] == "read":
         account = next((v[v.index("=") + 1 :] for v in remaining if v.startswith("account=")), None)
         invalid = [v for v in remaining if not v.startswith("account=")]
         if invalid:
             raise SMException(f"Invalid options for read: {'  ;  '.join(invalid)}")
-        return {"action": "read", "account": account}
+        return {"action": "read", "account": account}, params
     # send
     allowed_opts = ["recipient", "subject", "body", "file", "account"]
     mandatory_opts = ["subject", "body"]
@@ -694,7 +697,7 @@ def consume_args():
         raise SMException("Missing options for send: recipient")
     opts["files"] = [v[v.index("=") + 1 :] for v in remaining if v.startswith("file=")]
     opts.setdefault("account", None)
-    return {**opts, "action": "send"}
+    return {**opts, "action": "send"}, params
 
 
 def resolve_accounts(mail_connections_infos, account_name):
@@ -725,7 +728,7 @@ def main():
     account_names = [m.name for m in mail_connections_infos]
     if len(account_names) != len(set(account_names)):
         raise SMException("Duplicate account names in config")
-    args = consume_args()
+    args, params = consume_args(argv)
     if not args:
         return usage()
     if args["action"] == "send":
@@ -734,11 +737,11 @@ def main():
             raise SMException("No account specified and no default_account_for_send in config")
         send_email(
             resolve_accounts(mail_connections_infos, account_name)[0],
-            args["recipients"], args["subject"], args["body"], args["files"],
+            args["recipients"], args["subject"], args["body"], params, args["files"],
         )
     elif args["action"] == "sync":
         for account in resolve_accounts(mail_connections_infos, args["account"]):
-            sync_emails(account, auto_apply=args["auto_apply"])
+            sync_emails(account, params, auto_apply=args["auto_apply"])
     elif args["action"] == "read":
         accounts = resolve_accounts(mail_connections_infos, args["account"])
         if len(accounts) == 1:
