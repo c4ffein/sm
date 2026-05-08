@@ -19,7 +19,7 @@ lint-check:
 	ruff check --no-fix && ruff format --check
 
 test:
-	python3 test.py
+	python3 -m unittest discover tests
 
 install-build-system:
 	python3 -m pip install --upgrade build
