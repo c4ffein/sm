@@ -21,6 +21,7 @@ from sm import (
     SMException,
     Store,
     Verbosity,
+    _invalidate_cache_for_folder,
     _is_safe_folder_name,
     build_email_message,
     consume_args,
@@ -260,30 +261,30 @@ class TestStore(unittest.TestCase):
             self.assertTrue(sm.LOCK_PATH.exists())
         self.assertFalse(sm.LOCK_PATH.exists())
 
-    def test_save_index_roundtrips(self):
+    def test_save_roundtrips_messages(self):
         with Store(self.tmppath / "store") as store:
-            store.index["abc"] = {"subject": "test"}
-            store.save_index()
+            store.messages["abc"] = {"subject": "test"}
+            store.save()
         with Store(self.tmppath / "store") as store:
-            self.assertEqual(store.index, {"abc": {"subject": "test"}})
+            self.assertEqual(store.messages, {"abc": {"subject": "test"}})
 
     def test_load_index_missing_file(self):
         with Store(self.tmppath / "store") as store:
-            self.assertEqual(store.index, {})
+            self.assertEqual(store.messages, {})
 
     def test_load_index_empty_file(self):
         store_path = self.tmppath / "store"
         store_path.mkdir()
         (store_path / "index.json").write_text("")
         with Store(store_path) as store:
-            self.assertEqual(store.index, {})
+            self.assertEqual(store.messages, {})
 
     def test_load_index_whitespace_only(self):
         store_path = self.tmppath / "store"
         store_path.mkdir()
         (store_path / "index.json").write_text("   \n  ")
         with Store(store_path) as store:
-            self.assertEqual(store.index, {})
+            self.assertEqual(store.messages, {})
 
     def test_nested_context_raises(self):
         with Store(self.tmppath / "store"):
@@ -299,19 +300,73 @@ class TestStore(unittest.TestCase):
         # Stale lock not removed by failed acquire — that's the intended UX.
         self.assertTrue(sm.LOCK_PATH.exists())
 
-    def test_save_index_outside_context_raises(self):
+    def test_save_outside_context_raises(self):
         store = Store(self.tmppath / "store")
         with self.assertRaises(SMException):
-            store.save_index()
+            store.save()
 
-    def test_save_index_atomic_no_partial_file(self):
-        # After save_index, the temp file should be gone (rename moved it).
+    def test_save_atomic_no_partial_file(self):
+        # After save, the temp file should be gone (rename moved it).
         store_path = self.tmppath / "store"
         with Store(store_path) as store:
-            store.index["abc"] = {"subject": "test"}
-            store.save_index()
+            store.messages["abc"] = {"subject": "test"}
+            store.save()
             self.assertFalse((store_path / ".index.json.tmp").exists())
             self.assertTrue((store_path / "index.json").exists())
+
+    def test_folder_states_default_empty(self):
+        with Store(self.tmppath / "store") as store:
+            self.assertEqual(store.folder_states, {})
+
+    def test_save_persists_messages_and_folders_together(self):
+        # Both live in the same index.json — one save() persists both.
+        with Store(self.tmppath / "store") as store:
+            store.messages["abc"] = {"subject": "test"}
+            store.folder_states["INBOX"] = {"uidvalidity": 1234567890}
+            store.folder_states["[Gmail]/Sent"] = {"uidvalidity": 42}
+            store.save()
+        with Store(self.tmppath / "store") as store:
+            self.assertEqual(store.messages, {"abc": {"subject": "test"}})
+            self.assertEqual(store.folder_states["INBOX"]["uidvalidity"], 1234567890)
+            self.assertEqual(store.folder_states["[Gmail]/Sent"]["uidvalidity"], 42)
+
+    def test_index_json_format_is_nested(self):
+        # Lock the on-disk shape: top-level dict with "messages" and "folders" keys.
+        with Store(self.tmppath / "store") as store:
+            store.messages["abc"] = {"subject": "test"}
+            store.folder_states["INBOX"] = {"uidvalidity": 1}
+            store.save()
+        import json
+        on_disk = json.loads((self.tmppath / "store" / "index.json").read_text())
+        self.assertEqual(set(on_disk.keys()), {"messages", "folders"})
+        self.assertEqual(on_disk["messages"], {"abc": {"subject": "test"}})
+        self.assertEqual(on_disk["folders"], {"INBOX": {"uidvalidity": 1}})
+
+
+class TestInvalidateCacheForFolder(unittest.TestCase):
+    def test_removes_only_targeted_folder(self):
+        cache = {
+            ("INBOX", 1): "hash_a",
+            ("INBOX", 2): "hash_b",
+            ("[Gmail]/Sent", 1): "hash_c",
+            ("[Gmail]/Sent", 5): "hash_d",
+        }
+        removed = _invalidate_cache_for_folder(cache, "INBOX")
+        self.assertEqual(removed, 2)
+        self.assertEqual(cache, {
+            ("[Gmail]/Sent", 1): "hash_c",
+            ("[Gmail]/Sent", 5): "hash_d",
+        })
+
+    def test_returns_zero_when_folder_absent(self):
+        cache = {("INBOX", 1): "hash_a"}
+        self.assertEqual(_invalidate_cache_for_folder(cache, "Drafts"), 0)
+        self.assertEqual(cache, {("INBOX", 1): "hash_a"})
+
+    def test_empty_cache_no_op(self):
+        cache = {}
+        self.assertEqual(_invalidate_cache_for_folder(cache, "INBOX"), 0)
+        self.assertEqual(cache, {})
 
 
 class TestInternaldateKey(unittest.TestCase):
