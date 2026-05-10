@@ -1,11 +1,12 @@
-.PHONY: help verify lint lint-check test install-build-system build-package install-package-uploader upload-package-test upload-package
+.PHONY: help verify lint lint-check format-check test install-build-system build-package install-package-uploader upload-package-test upload-package
 
 help:
 	@echo "sm - Makefile commands"
 	@echo "────────────────────────────────────"
-	@echo "  make verify            - Read-only ready-to-commit check (lint-check + test)"
-	@echo "  make lint              - Fix linting issues with ruff (mutates files)"
-	@echo "  make lint-check        - Check linting + formatting without fixing"
+	@echo "  make verify            - Read-only ready-to-commit check (lint-check + format-check + test)"
+	@echo "  make lint              - Fix linting + formatting issues with ruff (mutates files)"
+	@echo "  make lint-check        - Check linting without fixing"
+	@echo "  make format-check      - Check formatting without fixing"
 	@echo "  make test              - Run tests"
 	@echo "  make install-build-system   - Install build tools"
 	@echo "  make build-package     - Build source distribution"
@@ -13,13 +14,16 @@ help:
 	@echo "  make upload-package-test - Upload to TestPyPI"
 	@echo "  make upload-package    - Upload to PyPI"
 
-verify: lint-check test
+verify: lint-check format-check test
 
 lint:
 	ruff check --fix; ruff format
 
 lint-check:
-	ruff check --no-fix && ruff format --check
+	ruff check --no-fix
+
+format-check:
+	ruff format --check
 
 test:
 	python3 -m unittest discover tests
