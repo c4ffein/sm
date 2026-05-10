@@ -14,6 +14,7 @@ from collections import namedtuple
 from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from email import encoders, message_from_bytes
+from email.header import decode_header
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -87,6 +88,31 @@ SAFE_PRINT_CHARS = set(
 def safe_str(text, allow_newlines=True):
     allowed = SAFE_PRINT_CHARS if allow_newlines else SAFE_PRINT_CHARS - {"\n", "\r"}
     return "".join(c if c in allowed else "\ufffd" for c in str(text))
+
+
+def decoded_header(msg, name, default=""):
+    """Return msg[name] as a plain decoded str, never an email.header.Header.
+    Handles RFC 2047 encoded-words and raw 8-bit bytes from non-conforming senders
+    (tries the declared charset, then UTF-8, then latin-1 as a last resort)."""
+    raw = msg.get(name)
+    if raw is None:
+        return default
+    try:
+        out = []
+        for chunk, charset in decode_header(raw):
+            if isinstance(chunk, bytes):
+                for enc in (charset, "utf-8", "latin-1"):
+                    if not enc:
+                        continue
+                    try:
+                        chunk = chunk.decode(enc)
+                        break
+                    except (UnicodeDecodeError, LookupError):
+                        continue
+            out.append(chunk)
+        return "".join(out)
+    except Exception:
+        return str(raw)
 
 
 ALLOWED_NAME_CHARS = "qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM0123456789.-_"
@@ -688,16 +714,18 @@ def _fetch_all_emails(account: MailConnectionInfos, store: Store, ctx: Context):
                     else:
                         email_data = message_from_bytes(raw_email)
                         store.messages[content_hash] = {
-                            "message_id": email_data.get("Message-ID", ""),
-                            "subject": email_data.get("Subject", ""),
-                            "from": email_data.get("From", ""),
-                            "date": email_data.get("Date", ""),
+                            "message_id": decoded_header(email_data, "Message-ID"),
+                            "subject": decoded_header(email_data, "Subject"),
+                            "from": decoded_header(email_data, "From"),
+                            "date": decoded_header(email_data, "Date"),
                             "internaldate": internaldate,
                             "history": [{"folder": folder, "uid": uid}],
                         }
                         store.save()
                         new_count += 1
-                        subject_preview = safe_str(email_data.get("Subject", "(no subject)")[:50], allow_newlines=False)
+                        subject_preview = safe_str(
+                            decoded_header(email_data, "Subject", "(no subject)")[:50], allow_newlines=False
+                        )
                         ctx.log(f"Fetched: {subject_preview}", Verbosity.DEBUG)
                 print(f"\r    {i}/{len(uids)}", end="", flush=True)
             if uids:

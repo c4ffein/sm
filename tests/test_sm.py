@@ -1374,6 +1374,27 @@ class TestSyncIntegration(unittest.TestCase):
             self.assertEqual(store.folder_states["INBOX"]["uidvalidity"], 42)
         self.assertEqual(ctx.errors, [])
 
+    def test_sync_handles_non_ascii_header(self):
+        # Non-conforming senders put raw 8-bit bytes (typically UTF-8) directly
+        # into headers without RFC 2047 encoding. Compat32 wraps those as
+        # email.header.Header, which json.dumps can't serialize → sync used to
+        # crash mid-fetch with the error masked as "Unknown error when trying
+        # to reach server" by the connection-error decorator.
+        inbox = self.imap.add_folder("INBOX")
+        inbox.add(_make_eml("Héllo wörld"))
+
+        ctx = Context()
+        sm.sync_emails(self._account(), ctx, auto_apply=True)
+
+        with Store(self.tmppath / "store") as store:
+            entry = next(iter(store.messages.values()))
+            self.assertIsInstance(entry["subject"], str)
+            self.assertEqual(entry["subject"], "Héllo wörld")
+        # And the index file on disk is valid JSON (the original failure mode).
+        import json
+
+        json.loads((self.tmppath / "store" / "index.json").read_text())
+
     def test_same_body_in_two_folders_dedups(self):
         body = _make_eml("shared")
         inbox = self.imap.add_folder("INBOX")
