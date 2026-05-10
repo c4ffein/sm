@@ -6,7 +6,8 @@ Single-file PoC mail client (`sm.py`). Stdlib-only. KISS.
 
 Run `make verify`. It runs:
 
-- `ruff check --no-fix` + `ruff format --check` — no auto-fix, just verify clean.
+- `ruff check --no-fix` (lint-check) — no auto-fix, just verify clean.
+- `ruff format --check` (format-check) — no auto-fix, just verify clean.
 - The test suite (`python3 -m unittest discover tests`).
 
 Don't auto-commit; the user does the commits.
@@ -15,7 +16,8 @@ Don't auto-commit; the user does the commits.
 
 - `make verify` — read-only "is this branch ready?" check. Run before declaring done.
 - `make lint` — auto-fix style + format (mutates files). Use during iteration.
-- `make lint-check` — same as the lint half of verify.
+- `make lint-check` — `ruff check --no-fix`, no formatting check.
+- `make format-check` — `ruff format --check`, no lint check.
 - `make test` — just the tests (~18s; integration tests use a real TLS fake server, so they need `openssl` — skip cleanly if absent).
 
 If ruff isn't installed: `pip install -e .[dev]` (the project's dev extras include it).
