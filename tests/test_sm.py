@@ -32,6 +32,7 @@ from sm import (
     is_live,
     kiss_extract_text_from_eml,
     list_attachments,
+    parse_authentication_results,
     parse_list_response,
     safe_str,
     save_attachment_bytes,
@@ -1773,6 +1774,137 @@ class TestSyncIntegration(unittest.TestCase):
             self.assertGreaterEqual(len(history), 2)
             self.assertTrue(history[0].get("removed"))
             self.assertFalse(history[-1].get("removed"))
+
+
+class TestParseAuthenticationResults(unittest.TestCase):
+    """Extract DKIM/SPF/DMARC verdicts from Authentication-Results headers (RFC 8601).
+    We surface what the receiving MTA decided; we don't re-verify."""
+
+    def _msg(self, *header_values):
+        msg = EmailMessage()
+        for v in header_values:
+            msg["Authentication-Results"] = v
+        return msg
+
+    def test_no_header_returns_empty(self):
+        self.assertEqual(parse_authentication_results(EmailMessage()), {})
+
+    def test_dkim_only(self):
+        msg = self._msg("example.com; dkim=pass header.d=foo.com")
+        self.assertEqual(parse_authentication_results(msg), {"dkim": "pass"})
+
+    def test_all_three_methods(self):
+        msg = self._msg(
+            "mx.example.com; spf=pass smtp.mailfrom=alice@foo.com; "
+            "dkim=pass header.d=foo.com; dmarc=pass action=none header.from=foo.com"
+        )
+        self.assertEqual(
+            parse_authentication_results(msg),
+            {"spf": "pass", "dkim": "pass", "dmarc": "pass"},
+        )
+
+    def test_failure_verdicts_extracted(self):
+        msg = self._msg("mx.example.com; spf=fail; dkim=permerror; dmarc=quarantine")
+        self.assertEqual(
+            parse_authentication_results(msg),
+            {"spf": "fail", "dkim": "permerror", "dmarc": "quarantine"},
+        )
+
+    def test_mixed_case_normalized(self):
+        msg = self._msg("example.com; DKIM=Pass; SPF=Fail")
+        self.assertEqual(parse_authentication_results(msg), {"dkim": "pass", "spf": "fail"})
+
+    def test_multiple_headers_last_wins(self):
+        # Simulates a chain: the most recent receiver's verdict overrides earlier ones.
+        msg = self._msg(
+            "old-receiver.example.com; dkim=fail",
+            "new-receiver.example.com; dkim=pass",
+        )
+        self.assertEqual(parse_authentication_results(msg), {"dkim": "pass"})
+
+    def test_unrelated_methods_ignored(self):
+        # iprev/arc/smime not in our scope.
+        msg = self._msg("example.com; iprev=pass; arc=fail; smime=none")
+        self.assertEqual(parse_authentication_results(msg), {})
+
+    def test_garbage_returns_empty(self):
+        msg = self._msg("totally not a header")
+        self.assertEqual(parse_authentication_results(msg), {})
+
+
+class TestReadUIShowsAuthResults(unittest.TestCase):
+    """End-to-end: the read UI surfaces the receiving MTA's auth verdict in the email view."""
+
+    def setUp(self):
+        import json
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmppath = Path(self._tmp.name)
+        self._orig_lock = sm.LOCK_PATH
+        self._orig_config = sm.CONFIG_PATH
+        self._orig_argv = sm.argv
+        sm.LOCK_PATH = self.tmppath / "lock"
+        sm.CONFIG_PATH = self.tmppath / "config.json"
+        Store._active = False
+        config = {"accounts": [{"name": "test", "local_store_path": str(self.tmppath / "store")}]}
+        sm.CONFIG_PATH.write_text(json.dumps(config))
+
+    def tearDown(self):
+        sm.LOCK_PATH = self._orig_lock
+        sm.CONFIG_PATH = self._orig_config
+        sm.argv = self._orig_argv
+        Store._active = False
+        self._tmp.cleanup()
+
+    def _index_one(self, eml_bytes):
+        with Store(self.tmppath / "store") as store:
+            content_hash = hashlib.sha256(eml_bytes).hexdigest()
+            (store.mails_path / f"{content_hash}.eml").write_bytes(eml_bytes)
+            store.messages[content_hash] = {
+                "subject": "auth check", "from": "alice@example.com",
+                "date": "Thu, 8 May 2026 14:30:00 +0000",
+                "internaldate": "08-May-2026 14:30:00 +0000",
+                "history": [{"folder": "INBOX", "uid": 1}],
+            }
+            store.save()
+
+    def test_auth_line_present_when_header_set(self):
+        msg = EmailMessage()
+        msg["From"] = "alice@example.com"
+        msg["To"] = "you@example.com"
+        msg["Subject"] = "auth check"
+        msg["Date"] = "Thu, 8 May 2026 14:30:00 +0000"
+        msg["Authentication-Results"] = "gmail.com; spf=pass; dkim=pass; dmarc=pass"
+        msg.set_content("hi")
+        self._index_one(msg.as_bytes())
+
+        sm.argv = ["sm", "read", "account=test"]
+        buf = io.StringIO()
+        with patch("builtins.input", side_effect=["1", "q"]):
+            with redirect_stdout(buf):
+                sm.main()
+        out = buf.getvalue()
+
+        self.assertIn("Auth:", out)
+        self.assertIn("DKIM=pass", out)
+        self.assertIn("SPF=pass", out)
+        self.assertIn("DMARC=pass", out)
+
+    def test_auth_line_absent_when_no_header(self):
+        msg = EmailMessage()
+        msg["From"] = "alice@example.com"
+        msg["To"] = "you@example.com"
+        msg["Subject"] = "no auth header"
+        msg["Date"] = "Thu, 8 May 2026 14:30:00 +0000"
+        msg.set_content("hi")
+        self._index_one(msg.as_bytes())
+
+        sm.argv = ["sm", "read", "account=test"]
+        buf = io.StringIO()
+        with patch("builtins.input", side_effect=["1", "q"]):
+            with redirect_stdout(buf):
+                sm.main()
+        # No Authentication-Results header → no Auth: line shown.
+        self.assertNotIn("Auth:", buf.getvalue())
 
 
 class TestReadUIErrorRecording(unittest.TestCase):
