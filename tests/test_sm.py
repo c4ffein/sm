@@ -1,4 +1,5 @@
 """Tests for sm. Run from repo root: python3 -m unittest discover tests"""
+
 import hashlib
 import io
 import socketserver
@@ -173,9 +174,7 @@ class TestConsumeArgs(unittest.TestCase):
         self.assertIsNone(action["account"])
 
     def test_send_multiple_recipients(self):
-        action, _ = consume_args(
-            ["sm", "send", "recipient=a@b.c", "recipient=d@e.f", "subject=hi", "body=hello"]
-        )
+        action, _ = consume_args(["sm", "send", "recipient=a@b.c", "recipient=d@e.f", "subject=hi", "body=hello"])
         self.assertEqual(action["recipients"], ["a@b.c", "d@e.f"])
 
     def test_send_multiple_files(self):
@@ -185,9 +184,7 @@ class TestConsumeArgs(unittest.TestCase):
         self.assertEqual(action["files"], ["/tmp/x", "/tmp/y"])
 
     def test_send_with_account(self):
-        action, _ = consume_args(
-            ["sm", "send", "recipient=a@b.c", "subject=hi", "body=hello", "account=work"]
-        )
+        action, _ = consume_args(["sm", "send", "recipient=a@b.c", "subject=hi", "body=hello", "account=work"])
         self.assertEqual(action["account"], "work")
 
     def test_send_missing_recipient(self):
@@ -341,6 +338,7 @@ class TestStore(unittest.TestCase):
             store.folder_states["INBOX"] = {"uidvalidity": 1}
             store.save()
         import json
+
         on_disk = json.loads((self.tmppath / "store" / "index.json").read_text())
         self.assertEqual(set(on_disk.keys()), {"messages", "folders"})
         self.assertEqual(on_disk["messages"], {"abc": {"subject": "test"}})
@@ -357,10 +355,13 @@ class TestInvalidateCacheForFolder(unittest.TestCase):
         }
         removed = _invalidate_cache_for_folder(cache, "INBOX")
         self.assertEqual(removed, 2)
-        self.assertEqual(cache, {
-            ("[Gmail]/Sent", 1): "hash_c",
-            ("[Gmail]/Sent", 5): "hash_d",
-        })
+        self.assertEqual(
+            cache,
+            {
+                ("[Gmail]/Sent", 1): "hash_c",
+                ("[Gmail]/Sent", 5): "hash_d",
+            },
+        )
 
     def test_returns_zero_when_folder_absent(self):
         cache = {("INBOX", 1): "hash_a"}
@@ -713,14 +714,14 @@ class TestParseListResponse(unittest.TestCase):
     def test_failures_record_specific_reasons_on_ctx(self):
         # Each failure mode tags the ErrorEvent.detail with a distinct reason.
         cases = [
-            (b"totally bogus",            "no opening paren"),
-            (b"(no closing",              "unterminated flag list"),
-            (b"() not_a_delim INBOX",     "expected delimiter"),
-            (b"() NIL",                   "missing mailbox name"),
-            (b'() "/" "unterminated',     "unterminated quoted mailbox name"),
-            (b'() "/" {abc}',             "non-numeric literal length"),
-            (b'() "/" {99}\r\nshort',     "literal length exceeds available bytes"),
-            (b'() "/" {bogus',            "malformed literal length marker"),
+            (b"totally bogus", "no opening paren"),
+            (b"(no closing", "unterminated flag list"),
+            (b"() not_a_delim INBOX", "expected delimiter"),
+            (b"() NIL", "missing mailbox name"),
+            (b'() "/" "unterminated', "unterminated quoted mailbox name"),
+            (b'() "/" {abc}', "non-numeric literal length"),
+            (b'() "/" {99}\r\nshort', "literal length exceeds available bytes"),
+            (b'() "/" {bogus', "malformed literal length marker"),
         ]
         for raw, expected in cases:
             with self.subTest(raw=raw):
@@ -877,11 +878,24 @@ def _generate_test_cert():
     try:
         subprocess.run(
             [
-                "openssl", "req", "-x509", "-newkey", "rsa:2048",
-                "-keyout", str(key_path), "-out", str(cert_path),
-                "-days", "1", "-nodes", "-subj", "/CN=localhost",
+                "openssl",
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-keyout",
+                str(key_path),
+                "-out",
+                str(cert_path),
+                "-days",
+                "1",
+                "-nodes",
+                "-subj",
+                "/CN=localhost",
             ],
-            check=True, capture_output=True, timeout=15,
+            check=True,
+            capture_output=True,
+            timeout=15,
         )
     except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return None
@@ -910,6 +924,7 @@ class _FakeSMTPServer:
 
     def start(self):
         outer = self
+
         class Handler(socketserver.StreamRequestHandler):
             timeout = 5
 
@@ -1093,6 +1108,7 @@ class TestSendEmailIntegration(unittest.TestCase):
 
 # ─── IMAP fake server + integration tests for sync_emails ───────────────────────
 
+
 class _FakeIMAPMessage:
     def __init__(self, uid, body, internaldate="01-Jan-2026 12:00:00 +0000"):
         self.uid = uid
@@ -1251,7 +1267,7 @@ class _FakeIMAPServer:
                                 continue
                             seq = self.selected.messages.index(msg) + 1
                             header = (
-                                f'* {seq} FETCH (UID {msg.uid} '
+                                f"* {seq} FETCH (UID {msg.uid} "
                                 f'INTERNALDATE "{msg.internaldate}" '
                                 f"RFC822 {{{len(msg.body)}}}\r\n"
                             ).encode("ascii")
@@ -1300,7 +1316,7 @@ def _make_eml(subject, body_text="hello", from_addr="alice@example.com"):
         f"Message-ID: <{subject.replace(' ', '_')}@example.com>\r\n"
         f"\r\n"
         f"{body_text}\r\n"
-    ).encode("utf-8")
+    ).encode()
 
 
 class TestSyncIntegration(unittest.TestCase):
@@ -1485,13 +1501,12 @@ class TestSyncIntegration(unittest.TestCase):
         # First two FETCHes succeed (1 message), then connection drops mid-fetch on the 3rd.
         # Expected: that one message is on disk + indexed (atomic save) when the sync raises.
         inbox = self.imap.add_folder("INBOX", uidvalidity=1)
-        inbox.add(_make_eml("survives"))   # uid 1 — fetched OK
-        inbox.add(_make_eml("orphaned"))   # uid 2 — connection drops before fetch returns
+        inbox.add(_make_eml("survives"))  # uid 1 — fetched OK
+        inbox.add(_make_eml("orphaned"))  # uid 2 — connection drops before fetch returns
 
         # The first SELECT does no FETCH; the failures count starts ticking on the FETCH call
         # for uid 1. We want uid 1 to succeed, uid 2 to fail. So skip 0 failures up to that point,
         # then drop. Easiest: drop only the second FETCH.
-        original_handler_check = inbox.fetch_failures_remaining
         # Track FETCH calls server-side: drop the 2nd one (and keep dropping after)
         inbox.fetch_failures_remaining = 0  # uid 1 fetches normally
         # We'll set it before uid 2's fetch runs — but we can't time that synchronously.
@@ -1508,13 +1523,15 @@ class TestSyncIntegration(unittest.TestCase):
         store_path = self.tmppath / "store"
         if (store_path / "index.json").exists():
             import json
+
             data = json.loads((store_path / "index.json").read_text())
             self.assertIn("messages", data)
             self.assertIn("folders", data)
             # Every indexed message must have its .eml on disk (no orphans pointing to missing files)
             for sha in data["messages"]:
-                self.assertTrue((store_path / "mails" / f"{sha}.eml").exists(),
-                                f"orphan index entry: {sha} has no .eml")
+                self.assertTrue(
+                    (store_path / "mails" / f"{sha}.eml").exists(), f"orphan index entry: {sha} has no .eml"
+                )
 
     def test_silent_retry_recovers(self):
         # Connection drops on the first FETCH, then succeeds on retry.
@@ -1558,8 +1575,7 @@ class TestSyncIntegration(unittest.TestCase):
         eml_files_after = list((self.tmppath / "store" / "mails").glob("*.eml"))
         self.assertEqual(len(eml_files_after), 1)
         self.assertEqual(eml_files_after[0].name, eml_files[0].name)  # same hash
-        self.assertEqual(hashlib.sha256(eml_files_after[0].read_bytes()).hexdigest() + ".eml",
-                         eml_files_after[0].name)
+        self.assertEqual(hashlib.sha256(eml_files_after[0].read_bytes()).hexdigest() + ".eml", eml_files_after[0].name)
         # Index unchanged, no duplicate entry.
         with Store(self.tmppath / "store") as store:
             self.assertEqual(len(store.messages), 1)
@@ -1613,9 +1629,9 @@ class TestSyncIntegration(unittest.TestCase):
             self.assertIn("Archive", history_folders)
             inbox_h = next(h for h in history if h["folder"] == "INBOX")
             archive_h = next(h for h in history if h["folder"] == "Archive")
-            self.assertTrue(inbox_h.get("removed"))   # old folder marked gone
+            self.assertTrue(inbox_h.get("removed"))  # old folder marked gone
             self.assertFalse(archive_h.get("removed"))  # current folder not removed
-            self.assertTrue(sm.is_live(entry))           # message isn't gone, just moved
+            self.assertTrue(sm.is_live(entry))  # message isn't gone, just moved
 
     def test_missing_eml_plus_unrelated_orphan(self):
         # Combined corruption: indexed message's .eml is gone AND an unrelated orphan exists.
@@ -1668,8 +1684,8 @@ class TestSyncIntegration(unittest.TestCase):
         #   [{A, uid_initial, removed}, {B, uid_at_B, removed}, {A, uid_back_in_A}]
         # is_live(entry) returns True (the trailing A entry is live).
         body = _make_eml("nomadic")
-        a = self.imap.add_folder("INBOX", uidvalidity=1)   # name "A" semantically
-        b = self.imap.add_folder("Archive", uidvalidity=1) # name "B" semantically
+        a = self.imap.add_folder("INBOX", uidvalidity=1)  # name "A" semantically
+        b = self.imap.add_folder("Archive", uidvalidity=1)  # name "B" semantically
         a.add(body)  # uid 1 in INBOX
 
         sm.sync_emails(self._account(), Context(), auto_apply=True)
@@ -1837,6 +1853,7 @@ class TestReadUIShowsAuthResults(unittest.TestCase):
 
     def setUp(self):
         import json
+
         self._tmp = tempfile.TemporaryDirectory()
         self.tmppath = Path(self._tmp.name)
         self._orig_lock = sm.LOCK_PATH
@@ -1860,7 +1877,8 @@ class TestReadUIShowsAuthResults(unittest.TestCase):
             content_hash = hashlib.sha256(eml_bytes).hexdigest()
             (store.mails_path / f"{content_hash}.eml").write_bytes(eml_bytes)
             store.messages[content_hash] = {
-                "subject": "auth check", "from": "alice@example.com",
+                "subject": "auth check",
+                "from": "alice@example.com",
                 "date": "Thu, 8 May 2026 14:30:00 +0000",
                 "internaldate": "08-May-2026 14:30:00 +0000",
                 "history": [{"folder": "INBOX", "uid": 1}],
@@ -1918,6 +1936,7 @@ class TestReadUIErrorRecording(unittest.TestCase):
 
     def setUp(self):
         import json
+
         self._tmp = tempfile.TemporaryDirectory()
         self.tmppath = Path(self._tmp.name)
         # Save + override module-level globals that main() touches
@@ -2138,8 +2157,11 @@ class TestSyncEmailsIsProducerOnly(unittest.TestCase):
 
     def _account(self):
         return MailConnectionInfos(
-            name="t", username="u", password="p",
-            imap_ssl_host="localhost", imap_ssl_port=self.imap.port,
+            name="t",
+            username="u",
+            password="p",
+            imap_ssl_host="localhost",
+            imap_ssl_port=self.imap.port,
             pinned_imap_certificate_sha256=self.cert_sha256,
             local_store_path=str(self.tmppath / "store"),
             ssl_cafile=str(self.cert_path),
@@ -2182,18 +2204,22 @@ class TestIsLiveIsGone(unittest.TestCase):
         self.assertFalse(is_gone(e))
 
     def test_all_removed_is_gone(self):
-        e = {"history": [
-            {"folder": "INBOX", "uid": 1, "removed": True},
-            {"folder": "Archive", "uid": 5, "removed": True},
-        ]}
+        e = {
+            "history": [
+                {"folder": "INBOX", "uid": 1, "removed": True},
+                {"folder": "Archive", "uid": 5, "removed": True},
+            ]
+        }
         self.assertFalse(is_live(e))
         self.assertTrue(is_gone(e))
 
     def test_mixed_is_live(self):
-        e = {"history": [
-            {"folder": "INBOX", "uid": 1, "removed": True},
-            {"folder": "Archive", "uid": 5},  # one live entry
-        ]}
+        e = {
+            "history": [
+                {"folder": "INBOX", "uid": 1, "removed": True},
+                {"folder": "Archive", "uid": 5},  # one live entry
+            ]
+        }
         self.assertTrue(is_live(e))
         self.assertFalse(is_gone(e))
 

@@ -17,8 +17,8 @@ if str(_REPO) not in sys.path:
 
 import sm  # noqa: E402  (path-setup above is the prerequisite)
 
-
 # ─── Email builder + sample mailbox ──────────────────────────────────────────────
+
 
 def build_eml(subject, frm, body=None, html=None, attachments=None):
     """Construct an RFC822 bytes blob varying body type and attachments."""
@@ -36,7 +36,7 @@ def build_eml(subject, frm, body=None, html=None, attachments=None):
         msg.set_content(html, subtype="html")
     else:
         msg.set_content("(empty)")
-    for filename, content in (attachments or []):
+    for filename, content in attachments or []:
         msg.add_attachment(content, maintype="application", subtype="octet-stream", filename=filename)
     return msg.as_bytes()
 
@@ -169,7 +169,7 @@ SAMPLE_ERRORS = [
     ("parse_list", "non-bytes/tuple input", b"42"),
     ("parse_list", "no opening paren on flag list", b"totally bogus line from the server"),
     ("parse_list", "unterminated flag list", b"(\\HasNoChildren) "),
-    ("parse_list", "folder name contains disallowed byte 0x0d", b"() \"/\" {7}\r\nINBOX\rX"),
+    ("parse_list", "folder name contains disallowed byte 0x0d", b'() "/" {7}\r\nINBOX\rX'),
     ("select_failed", "SELECT returned NO for folder '[Old]/Trashed'", None),
     ("select_error", "SELECT raised TimeoutError for folder 'Slow Folder': read timed out", None),
     ("unsafe_folder_name", "folder 'INBOX\\r\\nA1 LOGOUT' contains disallowed bytes; refusing to SELECT", None),
@@ -179,11 +179,12 @@ SAMPLE_ERRORS = [
 
 def populate_ctx_with_errors(ctx, errors=None):
     """Record SAMPLE_ERRORS (or a custom list of (kind, detail, raw) tuples) onto the given ctx."""
-    for kind, detail, raw in (errors if errors is not None else SAMPLE_ERRORS):
+    for kind, detail, raw in errors if errors is not None else SAMPLE_ERRORS:
         ctx.record_error(kind, detail, raw=raw)
 
 
 # ─── Tempdir mailbox context manager ─────────────────────────────────────────────
+
 
 @contextmanager
 def with_demo_store():

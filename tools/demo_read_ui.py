@@ -10,6 +10,7 @@ For the with-errors variant, see demo_read_with_errors.py.
 """
 
 import helpers
+
 import sm
 
 
@@ -20,7 +21,7 @@ def main():
         print()
         print(f"  sm demo (clean state) — synthetic mailbox at {store_path}")
         print(f"  {visible} visible / {hidden} hidden by is_live() filter")
-        print(f"  No errors pre-populated; the [e]rrors action will not appear.")
+        print("  No errors pre-populated; the [e]rrors action will not appear.")
         print()
         sm.read_emails(account, ctx)
 

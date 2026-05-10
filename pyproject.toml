@@ -66,3 +66,4 @@ line-length = 120
 
 [tool.ruff.lint.per-file-ignores]
 "sm.py" = ["C901"]  # No complexity check
+"tests/*" = ["C901"]  # No complexity check
