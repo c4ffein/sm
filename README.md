@@ -31,3 +31,13 @@ sm - Simple Mail client
   verbose= accepts 0/1/2 or error/info/debug (applies to all commands)
 You need to generate an app specific password for gmail or other mail clients
 ```
+
+## Demo
+
+Explore the read UI without configuring a real account:
+
+```
+python3 tools/demo_read_ui.py
+```
+
+Populates a tempdir mailbox with synthetic mail (varied subjects, attachments, HTML/plain bodies, multi-folder + moved-out messages) and launches the interactive reader against it. No real config is touched; the tempdir is cleaned up on exit.
