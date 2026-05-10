@@ -34,10 +34,12 @@ You need to generate an app specific password for gmail or other mail clients
 
 ## Demo
 
-Explore the read UI without configuring a real account:
+Three demo scripts under `tools/` exercise different parts of the UI without configuring a real account. Each populates synthetic data into a tempdir / Context; no real config is touched.
 
 ```
-python3 tools/demo_read_ui.py
+python3 tools/demo_read_ui.py            # read UI, clean state — no errors, no [e] action
+python3 tools/demo_read_with_errors.py   # read UI with pre-populated errors → press [e]
+python3 tools/demo_sync_errors.py        # sync error summary at each verbosity level
 ```
 
-Populates a tempdir mailbox with synthetic mail (varied subjects, attachments, HTML/plain bodies, multi-folder + moved-out messages) and launches the interactive reader against it. No real config is touched; the tempdir is cleaned up on exit.
+Shared building blocks live in `tools/helpers.py` (sample mailbox, sample errors, tempdir setup).
