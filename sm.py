@@ -975,6 +975,43 @@ def read_emails(account: MailConnectionInfos, ctx: Context):
         _read_emails_ui(account, store, ctx)
 
 
+_AUTH_RESULT_RE = re.compile(r"\b(dkim|spf|dmarc)\s*=\s*([a-zA-Z]+)", re.IGNORECASE)
+
+
+def parse_authentication_results(msg):
+    """Extract DKIM/SPF/DMARC verdicts from the message's Authentication-Results header(s).
+    Returns a dict like {'dkim': 'pass', 'spf': 'fail'}; empty dict if absent or unparseable.
+    Multiple headers are merged (last occurrence wins per method — most-recent receiver in the
+    chain). Other auth methods (iprev, arc, smime, ...) are deliberately ignored — out of scope.
+
+    We're surfacing the receiving MTA's verdict, not re-verifying. SPF needs the SMTP-time IP
+    we never see; DKIM may legitimately fail after MTA-side rewrites. The provider's verdict in
+    the header is what matters for "should I be suspicious of this sender?" UX."""
+    results = {}
+    for header_value in msg.get_all("Authentication-Results") or []:
+        for match in _AUTH_RESULT_RE.finditer(header_value):
+            method = match.group(1).lower()
+            verdict = match.group(2).lower()
+            results[method] = verdict
+    return results
+
+
+def _format_auth_results(auth):
+    """Render a parsed auth-results dict as a colorized one-liner. Empty dict → empty string."""
+    if not auth:
+        return ""
+    pieces = []
+    for method, verdict in sorted(auth.items()):
+        if verdict == "pass":
+            color = Color.GREEN.value
+        elif verdict in ("fail", "softfail", "permerror", "temperror"):
+            color = Color.RED.value
+        else:
+            color = Color.WHITE.value
+        pieces.append(f"{color}{method.upper()}={verdict}{Color.WHITE.value}")
+    return " | ".join(pieces)
+
+
 def _load_message_for_display(content_hash, store, ctx):
     """Load the .eml + parse + list attachments for one message. Recoverable failures (missing
     file, read I/O, parse error, attachment-walk crash) are recorded as `read_failed` ErrorEvents
@@ -1095,13 +1132,9 @@ def _read_emails_ui(account, store, ctx):
                 print(f"  From:    {safe_str(entry.get('from', ''), allow_newlines=False)}")
                 print(f"  Date:    {format_date(entry.get('date', ''))}")
                 print(f"  Subject: {safe_str(entry.get('subject', ''), allow_newlines=False)}")
-                # TODO: surface the receiving MTA's verdict here. Parse the `Authentication-Results:`
-                # header from the .eml (it's appended by Gmail/Fastmail/etc. at delivery time and
-                # carries SPF/DKIM/DMARC results) and print e.g. `Auth: DKIM=pass SPF=pass DMARC=pass`.
-                # We can't re-verify these ourselves (SPF needs the SMTP IP we never see; DKIM may
-                # legitimately fail after MTA-side rewrites), but surfacing the provider's verdict
-                # turns "the server quietly thinks this is suspicious" from invisible into visible.
-                # See conversation 2026-05-10 for the threat-model discussion.
+                auth_line = _format_auth_results(parse_authentication_results(msg))
+                if auth_line:
+                    print(f"  Auth:    {auth_line}")
                 print(f"{'═' * term_width}")
                 print(safe_str(kiss_extract_text_from_msg(msg), allow_newlines=True))
                 print(f"{'═' * term_width}")
