@@ -22,7 +22,7 @@ from enum import Enum
 from hashlib import sha256
 from html import unescape
 from imaplib import IMAP4_SSL
-from json import dumps, loads
+from json import JSONDecodeError, dumps, loads
 from pathlib import Path
 from smtplib import SMTP, SMTPAuthenticationError
 from socket import gaierror
@@ -172,12 +172,32 @@ def raise_smexception_on_connection_error(func):
 
 
 class Store:
+    """Local persistence for synced email — owns the lock, the index, and the .eml files.
+
+    On disk (under store_path):
+      mails/         one .eml per unique message, named <sha256>.eml (the content hash dedups
+                     the same body appearing in multiple folders).
+      index.json     combined message index + folder metadata. Shape:
+                       {"messages": {<sha256>: entry, ...},
+                        "folders":  {<folder_name>: state, ...}}
+
+    In memory (populated on context entry):
+      self.messages       {sha256_hash: entry}. Same body in multiple folders is one entry;
+                          entry["history"] lists every (folder, uid) we've seen it at.
+      self.folder_states  {folder_name: {"uidvalidity": int, ...}}, per-folder protocol
+                          bookkeeping. See RFC 3501 §2.3.1.1 for UIDVALIDITY semantics.
+
+    Lifecycle: `with Store(path) as store:` acquires a single-instance lock and loads from
+    disk. Mutate `store.messages` / `store.folder_states` freely, then `store.save()` to
+    persist (atomic temp + rename). Exiting the context releases the lock.
+    """
     _active = False
 
     def __init__(self, local_store_path):
         self.store_path = Path(local_store_path)
         self.mails_path = self.store_path / "mails"
-        self.index = None
+        self.messages = None       # {sha256_hash: entry}
+        self.folder_states = None  # {folder_name: {"uidvalidity": int}} — see RFC 3501 §2.3.1.1
 
     def __enter__(self):
         if Store._active:
@@ -193,7 +213,9 @@ class Store:
             ) from None
         try:
             self.mails_path.mkdir(mode=0o700, parents=True, exist_ok=True)
-            self.index = self._load_index()
+            data = self._load_index_file()
+            self.messages = data.get("messages", {})
+            self.folder_states = data.get("folders", {})
         except OSError as exc:
             LOCK_PATH.unlink()
             Store._active = False
@@ -204,23 +226,30 @@ class Store:
         LOCK_PATH.unlink()
         Store._active = False
 
-    def _load_index(self):
-        index_path = self.store_path / "index.json"
-        if index_path.exists():
-            content = index_path.read_text()
-            if not content.strip():
-                return {}
+    def _load_index_file(self):
+        path = self.store_path / "index.json"
+        if not path.exists():
+            return {}
+        content = path.read_text()
+        if not content.strip():
+            return {}
+        try:
             return loads(content)
-        return {}
+        except JSONDecodeError as exc:
+            raise SMException(
+                f"index.json at {path} is corrupted ({exc.msg} at line {exc.lineno} col {exc.colno}). "
+                f"Rename or remove the file and re-sync to recover."
+            ) from exc
 
-    def save_index(self):
+    def save(self):
+        """Persist messages + folder_states to index.json (atomic temp + rename)."""
         if not Store._active:
-            raise SMException("Cannot save index outside of Store context")
-        index_path = self.store_path / "index.json"
+            raise SMException("Cannot save outside of Store context")
+        path = self.store_path / "index.json"
         temp_path = self.store_path / ".index.json.tmp"
         with temp_path.open("w") as f:
-            f.write(dumps(self.index, indent=2))
-        temp_path.rename(index_path)
+            f.write(dumps({"messages": self.messages, "folders": self.folder_states}, indent=2))
+        temp_path.rename(path)
 
 
 @dataclass
@@ -463,6 +492,27 @@ def parse_list_response(item, ctx=None):
     )
 
 
+def _invalidate_cache_for_folder(known_uids, folder):
+    """Drop every (folder, uid) -> hash entry for `folder`. Returns the number of removed entries.
+    Used when UIDVALIDITY changes — old UIDs no longer point to the messages we cached against them."""
+    keys = [k for k in known_uids if k[0] == folder]
+    for k in keys:
+        del known_uids[k]
+    return len(keys)
+
+
+def _read_uidvalidity(mail):
+    """Return the UIDVALIDITY of the currently-selected folder as an int, or None if absent/malformed.
+    imaplib stores UIDVALIDITY in its untagged-response cache after SELECT."""
+    typ, data = mail.response("UIDVALIDITY")
+    if not data or not data[0]:
+        return None
+    try:
+        return int(data[0])
+    except (ValueError, TypeError):
+        return None
+
+
 @raise_smexception_on_connection_error
 def _fetch_all_emails(account: MailConnectionInfos, store: Store, ctx: Context):
     """Core: connect, iterate all folders/UIDs, download new emails, update index.
@@ -484,14 +534,12 @@ def _fetch_all_emails(account: MailConnectionInfos, store: Store, ctx: Context):
         if not folders:
             raise SMException(f"No folders found. Raw response: {folder_data[:3]}...")
 
-        # Build reverse lookup: (folder, uid) -> content_hash from existing index
-        # TODO: UIDVALIDITY — IMAP assigns a UIDVALIDITY value per folder (returned on SELECT).
-        #   As long as it stays the same, UIDs are stable and never reused. If it changes (server
-        #   rebuild, migration, etc.), all cached (folder, uid) mappings are invalid.
-        #   We should store UIDVALIDITY per folder in the index, check it on SELECT, and when it
-        #   changes, invalidate cached UIDs for that folder and re-fetch to re-link emails to new UIDs.
+        # Build reverse lookup: (folder, uid) -> content_hash from existing index.
+        # UIDVALIDITY (per-folder, returned on SELECT) gates this cache: if it changes, the
+        # (folder, uid) pairs we cached against the old UIDVALIDITY no longer correspond to the
+        # same messages on the server. We invalidate the cache for that folder when it happens.
         known_uids = {}
-        for content_hash, entry in store.index.items():
+        for content_hash, entry in store.messages.items():
             for h in entry.get("history", []):
                 known_uids[(h["folder"], h["uid"])] = content_hash
 
@@ -514,6 +562,25 @@ def _fetch_all_emails(account: MailConnectionInfos, store: Store, ctx: Context):
                 ctx.log(f"Skipping folder: {safe_str(folder, allow_newlines=False)}", Verbosity.DEBUG)
                 ctx.record_error("select_error", f"SELECT raised {type(exc).__name__} for folder {folder!r}: {exc}")
                 continue
+
+            # UIDVALIDITY check: if the server's value differs from what we stored, our cached
+            # (folder, uid) mappings are stale — drop them so this folder gets fully re-fetched.
+            # Content-hash dedup avoids rewriting .eml files we already have on disk.
+            current_uidv = _read_uidvalidity(mail)
+            stored_uidv = store.folder_states.get(folder, {}).get("uidvalidity")
+            if current_uidv is not None and stored_uidv is not None and current_uidv != stored_uidv:
+                removed = _invalidate_cache_for_folder(known_uids, folder)
+                ctx.log(
+                    f"UIDVALIDITY changed for {safe_str(folder, allow_newlines=False)}: "
+                    f"{stored_uidv} -> {current_uidv}; re-fetching {removed} cached entr{'y' if removed == 1 else 'ies'}",
+                    Verbosity.INFO,
+                )
+                ctx.record_error(
+                    "uidvalidity_changed",
+                    f"folder {folder!r} UIDVALIDITY changed from {stored_uidv} to {current_uidv}; cache invalidated",
+                )
+            if current_uidv is not None:
+                store.folder_states.setdefault(folder, {})["uidvalidity"] = current_uidv
 
             result, data = mail.uid("SEARCH", None, "ALL")
             if not data[0]:
@@ -544,20 +611,14 @@ def _fetch_all_emails(account: MailConnectionInfos, store: Store, ctx: Context):
                         end = header.find('"', start)
                         internaldate = header[start:end]
 
-                    if content_hash in store.index:
-                        existing = store.index[content_hash]
-                        existing.pop("deleted", None)
-                        folder_names = [h["folder"] for h in existing.get("history", [])]
-                        if folder not in folder_names:
-                            existing.setdefault("history", []).append({"folder": folder, "uid": uid})
-                            store.save_index()
-                    else:
-                        # New email (or orphan recovery)
-                        email_data = message_from_bytes(raw_email)
-                        eml_path = store.mails_path / f"{content_hash}.eml"
-
-                        if eml_path.exists():
-                            # Paranoid mode: orphan .eml exists, verify content matches
+                    # Ensure the .eml is on disk regardless of whether we already index this hash:
+                    #   - new message:                    write
+                    #   - indexed but file missing:       write (recovery from manual delete / partial run)
+                    #   - orphan file not yet indexed:    paranoid hash check, adopt
+                    #   - indexed and file present:       trust (no per-fetch hash check, expensive at scale)
+                    eml_path = store.mails_path / f"{content_hash}.eml"
+                    if eml_path.exists():
+                        if content_hash not in store.messages:
                             with eml_path.open("rb") as f:
                                 existing_hash = sha256(f.read()).hexdigest()
                             if existing_hash != content_hash:
@@ -565,15 +626,33 @@ def _fetch_all_emails(account: MailConnectionInfos, store: Store, ctx: Context):
                                     f"Corruption detected: {eml_path} hash mismatch "
                                     f"(expected {content_hash}, got {existing_hash})"
                                 )
-                            # Orphan recovered, just index it
-                        else:
-                            # Atomic write: temp file + rename
-                            temp_path = store.mails_path / f".{content_hash}.eml.tmp"
-                            with temp_path.open("wb") as f:
-                                f.write(raw_email)
-                            temp_path.rename(eml_path)
+                    else:
+                        temp_path = store.mails_path / f".{content_hash}.eml.tmp"
+                        with temp_path.open("wb") as f:
+                            f.write(raw_email)
+                        temp_path.rename(eml_path)
 
-                        store.index[content_hash] = {
+                    if content_hash in store.messages:
+                        existing = store.messages[content_hash]
+                        # `folder_names` must consider only LIVE history entries — a folder we
+                        # previously left (entry has removed=True) should accept a fresh live
+                        # entry on return, not be treated as "already there." This is the
+                        # A → B → A case.
+                        live = {h["folder"]: h for h in existing.get("history", []) if not h.get("removed")}
+                        if folder not in live:
+                            # New folder for this message OR resurrection of a previously-removed one.
+                            existing.setdefault("history", []).append({"folder": folder, "uid": uid})
+                            store.save()
+                        else:
+                            # Folder is currently live. UID may have changed (UIDVALIDITY bump on
+                            # a message that stayed in the folder); update it in place.
+                            h = live[folder]
+                            if h.get("uid") != uid:
+                                h["uid"] = uid
+                                store.save()
+                    else:
+                        email_data = message_from_bytes(raw_email)
+                        store.messages[content_hash] = {
                             "message_id": email_data.get("Message-ID", ""),
                             "subject": email_data.get("Subject", ""),
                             "from": email_data.get("From", ""),
@@ -581,34 +660,86 @@ def _fetch_all_emails(account: MailConnectionInfos, store: Store, ctx: Context):
                             "internaldate": internaldate,
                             "history": [{"folder": folder, "uid": uid}],
                         }
-                        store.save_index()
+                        store.save()
                         new_count += 1
                         ctx.log(f"Fetched: {safe_str(email_data.get('Subject', '(no subject)')[:50], allow_newlines=False)}", Verbosity.DEBUG)
                 print(f"\r    {i}/{len(uids)}", end="", flush=True)
             if uids:
                 print()
 
+        store.save()  # persist any folder_state updates that didn't trigger a per-message save
         return server_state, new_count
     finally:
         mail.logout()
 
 
-def sync_emails(account: MailConnectionInfos, ctx: Context, auto_apply=False):
-    """Sync local state with remote: fetch new emails, then detect deletions and moves with user review."""
-    with Store(account.local_store_path) as store:
-        server_state, new_count = _fetch_all_emails(account, store, ctx)
-        _sync_apply(account, store, server_state, new_count, auto_apply, ctx)
+def sync_emails(account: MailConnectionInfos, ctx: Context, auto_apply=False, max_silent_retries=2):
+    """Sync local state with remote: fetch new emails, then detect deletions and moves with user review.
+
+    On SMException, silently retry up to max_silent_retries times (transient network errors recover
+    cleanly because saves are atomic — partial progress on disk is consistent and the next attempt
+    resumes from there). After silent retries are exhausted, prompt the user `Retry? [y/N]`. Saying
+    yes runs another batch of silent retries; saying no re-raises the last exception. Set
+    max_silent_retries=0 for no retry at all (e.g., in tests, or to fail fast)."""
+    while True:
+        last_exc = None
+        for attempt in range(max_silent_retries + 1):
+            try:
+                with Store(account.local_store_path) as store:
+                    server_state, new_count = _fetch_all_emails(account, store, ctx)
+                    _sync_apply(account, store, server_state, new_count, auto_apply, ctx)
+                return
+            except SMException as exc:
+                last_exc = exc
+                if attempt < max_silent_retries:
+                    ctx.log(
+                        f"sync attempt {attempt + 1} failed: {exc}; retrying ({max_silent_retries - attempt} left)",
+                        Verbosity.INFO,
+                    )
+        try:
+            choice = input(
+                f"  sync failed after {max_silent_retries + 1} attempt(s): {last_exc}\n"
+                f"  Retry? [y/N] "
+            ).strip().lower()
+        except EOFError:
+            choice = "n"
+        if choice not in ("y", "yes"):
+            raise last_exc
+
+
+def is_live(entry):
+    """True iff at least one history entry is still live (not marked removed).
+    Empty history is treated as gone (defensive — entries are always created with one history item)."""
+    return any(not h.get("removed") for h in entry.get("history", []))
+
+
+def is_gone(entry):
+    """True iff the message has no live folder location anywhere we've synced.
+    Equivalent to `not is_live(entry)`. See `_sync_apply` for the eventual-consistency contract:
+    "gone" is a snapshot judgment over the synced folder set at the time of the diff."""
+    return not is_live(entry)
 
 
 def _sync_apply(account, store, server_state, new_count, auto_apply, ctx):
+    """Diff the in-memory `server_state` (just produced by `_fetch_all_emails`) against
+    `store.messages`. Surface deletions and moves to the user (or apply silently if `auto_apply`).
+
+    Eventual-consistency contract: the diff is a *snapshot judgment* over the folders we synced
+    this run. It is NOT atomic across folders — a concurrent server-side move during sync can
+    produce stale presence claims that self-correct on the next sync. A message that "looks gone"
+    here may be in a folder we don't sync, or in transit. The `.eml` file on disk is preserved
+    regardless of the gone flag — if you ever need to recover from a misclaim, the bytes are
+    still in `mails/<sha256>.eml` and you can grep through them or re-sync to discover the
+    current location.
+    """
     if new_count:
         ctx.log(f"  Fetched {new_count} new email(s)", Verbosity.INFO)
 
     changelog = []
-    for content_hash, entry in store.index.items():
+    for content_hash, entry in store.messages.items():
         subj = safe_str(entry.get("subject", "(no subject)")[:50], allow_newlines=False)
         if content_hash not in server_state:
-            if not entry.get("deleted"):
+            if is_live(entry):
                 changelog.append(("D", content_hash, subj, entry))
         else:
             current_folders = {loc["folder"] for loc in server_state[content_hash]}
@@ -652,23 +783,30 @@ def _sync_apply(account, store, server_state, new_count, auto_apply, ctx):
 
     if not apply:
         ctx.log("  Server-side changes discarded (newly fetched emails are still saved).", Verbosity.INFO)
-        store.save_index()
+        store.save()
         return
 
     for kind, content_hash, _desc, entry in changelog:
         if kind == "D":
-            entry["deleted"] = True
+            # No current location anywhere we synced — mark every live history entry removed.
+            # The .eml file stays on disk; resurrection (if the message reappears) is handled
+            # naturally by the fetch loop appending a fresh live entry.
+            for h in entry.get("history", []):
+                h["removed"] = True
         elif kind == "M":
             current_folders = {loc["folder"] for loc in server_state[content_hash]}
+            # Mirror the fix in `_fetch_all_emails`: only consider live history entries when
+            # deciding whether a folder is "already in history." Otherwise a folder we previously
+            # left and are now back in (entry has removed=True) wouldn't get a fresh live entry.
             for loc in server_state[content_hash]:
-                folder_names = [h["folder"] for h in entry.get("history", [])]
-                if loc["folder"] not in folder_names:
+                live_folder_names = {h["folder"] for h in entry.get("history", []) if not h.get("removed")}
+                if loc["folder"] not in live_folder_names:
                     entry.setdefault("history", []).append(loc)
             for h in entry.get("history", []):
                 if h["folder"] not in current_folders:
                     h["removed"] = True
 
-    store.save_index()
+    store.save()
     ctx.log(f"  Applied: {len(deletions)} deletion(s), {len(moves)} move(s).", Verbosity.INFO)
     # TODO: surface ctx.errors here — e.g. "N folders skipped (run with verbose=2 for details)" grouped by ErrorEvent.kind.
 
@@ -817,10 +955,10 @@ def read_emails(account: MailConnectionInfos):
 
 
 def _read_emails_ui(account, store):
-    if not store.index:
+    if not store.messages:
         raise SMException(f"No emails found for account {account.name}. Run sync first.")
 
-    entries = [(h, e) for h, e in store.index.items() if not e.get("deleted")]
+    entries = [(h, e) for h, e in store.messages.items() if is_live(e)]
     entries.sort(key=lambda x: internaldate_key(x[1]), reverse=True)
     if not entries:
         raise SMException(f"No non-deleted emails found for account {account.name}.")
@@ -887,6 +1025,13 @@ def _read_emails_ui(account, store):
                 print(f"  From:    {safe_str(entry.get('from', ''), allow_newlines=False)}")
                 print(f"  Date:    {format_date(entry.get('date', ''))}")
                 print(f"  Subject: {safe_str(entry.get('subject', ''), allow_newlines=False)}")
+                # TODO: surface the receiving MTA's verdict here. Parse the `Authentication-Results:`
+                # header from the .eml (it's appended by Gmail/Fastmail/etc. at delivery time and
+                # carries SPF/DKIM/DMARC results) and print e.g. `Auth: DKIM=pass SPF=pass DMARC=pass`.
+                # We can't re-verify these ourselves (SPF needs the SMTP IP we never see; DKIM may
+                # legitimately fail after MTA-side rewrites), but surfacing the provider's verdict
+                # turns "the server quietly thinks this is suspicious" from invisible into visible.
+                # See conversation 2026-05-10 for the threat-model discussion.
                 print(f"{'═' * term_width}")
                 print(safe_str(kiss_extract_text_from_msg(msg), allow_newlines=True))
                 print(f"{'═' * term_width}")
