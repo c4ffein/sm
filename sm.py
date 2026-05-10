@@ -171,6 +171,20 @@ def raise_smexception_on_connection_error(func):
 
 
 
+@dataclass
+class StoreSnapshot:
+    """Lock-free read-only view of the on-disk store. Returned by `Store.load_snapshot`.
+
+    .eml files are content-addressed (sha256) and write-once, so reading them lazily off
+    the snapshot is safe even if a concurrent sync is updating index.json — the worst
+    case is staleness (missing newer messages), never inconsistency.
+
+    Do not mutate. Persistence requires `with Store(...) as store: ...` instead."""
+    messages: dict
+    folder_states: dict
+    mails_path: Path
+
+
 class Store:
     """Local persistence for synced email — owns the lock, the index, and the .eml files.
 
@@ -190,6 +204,9 @@ class Store:
     Lifecycle: `with Store(path) as store:` acquires a single-instance lock and loads from
     disk. Mutate `store.messages` / `store.folder_states` freely, then `store.save()` to
     persist (atomic temp + rename). Exiting the context releases the lock.
+
+    For read-only flows (reader UI, demos, reporting), use `Store.load_snapshot(path)` —
+    it returns a `StoreSnapshot` without acquiring the lock, so it doesn't block syncs.
     """
     _active = False
 
@@ -213,7 +230,7 @@ class Store:
             ) from None
         try:
             self.mails_path.mkdir(mode=0o700, parents=True, exist_ok=True)
-            data = self._load_index_file()
+            data = self._load_index_file(self.store_path)
             self.messages = data.get("messages", {})
             self.folder_states = data.get("folders", {})
         except OSError as exc:
@@ -226,8 +243,9 @@ class Store:
         LOCK_PATH.unlink()
         Store._active = False
 
-    def _load_index_file(self):
-        path = self.store_path / "index.json"
+    @staticmethod
+    def _load_index_file(store_path):
+        path = store_path / "index.json"
         if not path.exists():
             return {}
         content = path.read_text()
@@ -240,6 +258,17 @@ class Store:
                 f"index.json at {path} is corrupted ({exc.msg} at line {exc.lineno} col {exc.colno}). "
                 f"Rename or remove the file and re-sync to recover."
             ) from exc
+
+    @classmethod
+    def load_snapshot(cls, local_store_path):
+        """Read-only load with no lock acquired. See StoreSnapshot for the staleness contract."""
+        store_path = Path(local_store_path)
+        data = cls._load_index_file(store_path)
+        return StoreSnapshot(
+            messages=data.get("messages", {}),
+            folder_states=data.get("folders", {}),
+            mails_path=store_path / "mails",
+        )
 
     def save(self):
         """Persist messages + folder_states to index.json (atomic temp + rename)."""
@@ -971,8 +1000,8 @@ def _save_attachment_action(attachments):
 
 
 def read_emails(account: MailConnectionInfos, ctx: Context):
-    with Store(account.local_store_path) as store:
-        _read_emails_ui(account, store, ctx)
+    snapshot = Store.load_snapshot(account.local_store_path)
+    _read_emails_ui(account, snapshot, ctx)
 
 
 _AUTH_RESULT_RE = re.compile(r"\b(dkim|spf|dmarc)\s*=\s*([a-zA-Z]+)", re.IGNORECASE)
@@ -1012,11 +1041,11 @@ def _format_auth_results(auth):
     return " | ".join(pieces)
 
 
-def _load_message_for_display(content_hash, store, ctx):
+def _load_message_for_display(content_hash, mails_path, ctx):
     """Load the .eml + parse + list attachments for one message. Recoverable failures (missing
     file, read I/O, parse error, attachment-walk crash) are recorded as `read_failed` ErrorEvents
     and returned as None — the UI loop continues. Returns (msg, attachments) on success."""
-    eml_path = store.mails_path / f"{content_hash}.eml"
+    eml_path = mails_path / f"{content_hash}.eml"
     if not eml_path.exists():
         ctx.record_error(
             "read_failed",
@@ -1058,11 +1087,11 @@ def _show_errors_screen(ctx, term_width):
         pass
 
 
-def _read_emails_ui(account, store, ctx):
-    if not store.messages:
+def _read_emails_ui(account, snapshot, ctx):
+    if not snapshot.messages:
         raise SMException(f"No emails found for account {account.name}. Run sync first.")
 
-    entries = [(h, e) for h, e in store.messages.items() if is_live(e)]
+    entries = [(h, e) for h, e in snapshot.messages.items() if is_live(e)]
     entries.sort(key=lambda x: internaldate_key(x[1]), reverse=True)
     if not entries:
         raise SMException(f"No non-deleted emails found for account {account.name}.")
@@ -1122,7 +1151,7 @@ def _read_emails_ui(account, store, ctx):
             idx = int(cmd) - 1
             if 0 <= idx < len(entries):
                 content_hash, entry = entries[idx]
-                loaded = _load_message_for_display(content_hash, store, ctx)
+                loaded = _load_message_for_display(content_hash, snapshot.mails_path, ctx)
                 if loaded is None:
                     print("  Failed to load email — recorded; press [e] to view details.")
                     continue
