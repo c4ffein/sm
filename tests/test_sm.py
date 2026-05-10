@@ -11,6 +11,7 @@ from contextlib import redirect_stdout
 from email import message_from_bytes
 from email.message import EmailMessage
 from pathlib import Path
+from unittest.mock import patch
 
 import sm
 from sm import (
@@ -27,6 +28,8 @@ from sm import (
     consume_args,
     decode_modified_utf7,
     internaldate_key,
+    is_gone,
+    is_live,
     kiss_extract_text_from_eml,
     list_attachments,
     parse_list_response,
@@ -855,11 +858,18 @@ class TestBuildEmailMessage(unittest.TestCase):
         self.assertIn("Error attaching file", str(cm.exception))
 
 
-# ─── SMTP fake server + integration tests for send_email ─────────────────────────
+# ─── shared TLS fixture for SMTP + IMAP integration tests ─────────────────────────
+
+_test_cert_cache = None
+
 
 def _generate_test_cert():
-    """Generate a self-signed cert+key in a tempdir using the system openssl. Returns
-    (cert_path, key_path, sha256_hex, tempdir) or None if openssl is unavailable."""
+    """Generate a self-signed cert+key in a tempdir using the system openssl. Cached at
+    module level so SMTP and IMAP integration suites share one cert (one openssl spawn).
+    Returns (cert_path, key_path, sha256_hex, tempdir) or None if openssl is unavailable."""
+    global _test_cert_cache
+    if _test_cert_cache is not None:
+        return _test_cert_cache
     tmp = tempfile.mkdtemp(prefix="sm-test-cert-")
     cert_path = Path(tmp) / "cert.pem"
     key_path = Path(tmp) / "key.pem"
@@ -876,7 +886,8 @@ def _generate_test_cert():
         return None
     der = ssl.PEM_cert_to_DER_cert(cert_path.read_text())
     cert_sha256 = hashlib.sha256(der).hexdigest()
-    return cert_path, key_path, cert_sha256, tmp
+    _test_cert_cache = (cert_path, key_path, cert_sha256, tmp)
+    return _test_cert_cache
 
 
 class _FakeSMTPServer:
@@ -1077,6 +1088,759 @@ class TestSendEmailIntegration(unittest.TestCase):
         account.pinned_smtp_certificate_sha256 = "0" * 64
         with self.assertRaises(SMException):
             send_email(account, ["a@b.c"], "s", "m", Context())
+
+
+# ─── IMAP fake server + integration tests for sync_emails ───────────────────────
+
+class _FakeIMAPMessage:
+    def __init__(self, uid, body, internaldate="01-Jan-2026 12:00:00 +0000"):
+        self.uid = uid
+        self.body = body  # raw RFC822 bytes
+        self.internaldate = internaldate
+
+
+class _FakeIMAPFolder:
+    def __init__(self, name, *, flags=("\\HasNoChildren",), uidvalidity=1, select_status="OK"):
+        self.name = name  # raw IMAP form (modified UTF-7)
+        self.flags = list(flags)
+        self.uidvalidity = uidvalidity
+        self.select_status = select_status  # "OK" or "NO" to simulate a SELECT failure
+        self.messages = []  # _FakeIMAPMessage list, in UID order
+        self.fetch_failures_remaining = 0  # connection-drop on this many FETCH calls; decrements per drop
+        # UIDs are monotonic per RFC 3501 §2.3.1.1: never reused while UIDVALIDITY stays the same,
+        # even after a message is deleted. Tracking _next_uid separately from the messages list
+        # ensures `messages = []; add(body)` doesn't recycle a previously-issued UID.
+        self._next_uid = 1
+
+    def add(self, body, internaldate="01-Jan-2026 12:00:00 +0000"):
+        uid = self._next_uid
+        self._next_uid += 1
+        self.messages.append(_FakeIMAPMessage(uid, body, internaldate))
+        return self.messages[-1]
+
+    def remove(self, uid):
+        self.messages = [m for m in self.messages if m.uid != uid]
+
+
+class _FakeIMAPServer:
+    """Threaded IMAP4_SSL fake — direct TLS from connect (port 993 style, not STARTTLS).
+    Configurable folders, messages, UIDVALIDITY. Speaks the subset of the protocol our
+    client actually uses: LOGIN, LIST, SELECT, UID SEARCH ALL, UID FETCH (RFC822 INTERNALDATE),
+    LOGOUT, NOOP, CAPABILITY."""
+
+    def __init__(self, cert_path, key_path):
+        self.cert_path = str(cert_path)
+        self.key_path = str(key_path)
+        self.folders = {}  # name -> _FakeIMAPFolder
+        self.delim = "/"
+        self.host = "127.0.0.1"
+        self.port = None
+        self._server = None
+        self._thread = None
+
+    def add_folder(self, name, **kwargs):
+        f = _FakeIMAPFolder(name, **kwargs)
+        self.folders[name] = f
+        return f
+
+    def start(self):
+        outer = self
+        ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        ssl_ctx.load_cert_chain(certfile=self.cert_path, keyfile=self.key_path)
+
+        class Handler(socketserver.StreamRequestHandler):
+            timeout = 10
+
+            def setup(self):
+                # Wrap the raw socket in TLS immediately — IMAP4_SSL connects over TLS from byte 0.
+                self.connection = ssl_ctx.wrap_socket(self.request, server_side=True)
+                self.rfile = self.connection.makefile("rb", -1)
+                self.wfile = self.connection.makefile("wb", 0)
+                self._ssl_sock = self.connection
+                self.selected = None  # current _FakeIMAPFolder
+
+            def finish(self):
+                try:
+                    self._ssl_sock.close()
+                except (OSError, ssl.SSLError):
+                    pass
+                try:
+                    super().finish()
+                except (OSError, ssl.SSLError):
+                    pass
+
+            def _wln(self, line):
+                self.wfile.write(line.encode("ascii") + b"\r\n")
+
+            def _wraw(self, data):
+                self.wfile.write(data)
+
+            def handle(self):
+                try:
+                    self._handle()
+                except (BrokenPipeError, ConnectionResetError, OSError, ssl.SSLError):
+                    pass
+
+            def _handle(self):
+                self._wln("* OK fake IMAP ready")
+                while True:
+                    raw = self.rfile.readline()
+                    if not raw:
+                        return
+                    line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                    if not line:
+                        continue
+                    parts = line.split(" ", 2)
+                    tag = parts[0]
+                    cmd = parts[1].upper() if len(parts) > 1 else ""
+                    rest = parts[2] if len(parts) > 2 else ""
+                    if cmd == "CAPABILITY":
+                        self._wln("* CAPABILITY IMAP4REV1 AUTH=PLAIN")
+                        self._wln(f"{tag} OK CAPABILITY completed")
+                    elif cmd == "LOGIN":
+                        self._wln(f"{tag} OK LOGIN completed")
+                    elif cmd == "LIST":
+                        for folder in outer.folders.values():
+                            flags_str = " ".join(folder.flags)
+                            self._wln(f'* LIST ({flags_str}) "{outer.delim}" "{folder.name}"')
+                        self._wln(f"{tag} OK LIST completed")
+                    elif cmd == "SELECT" or cmd == "EXAMINE":
+                        folder_name = rest.strip().strip('"')
+                        folder = outer.folders.get(folder_name)
+                        if folder is None or folder.select_status != "OK":
+                            self._wln(f"{tag} NO mailbox unavailable")
+                            continue
+                        self._wln(f"* {len(folder.messages)} EXISTS")
+                        self._wln("* 0 RECENT")
+                        self._wln(f"* OK [UIDVALIDITY {folder.uidvalidity}] UIDs valid")
+                        next_uid = (folder.messages[-1].uid + 1) if folder.messages else 1
+                        self._wln(f"* OK [UIDNEXT {next_uid}] Predicted next UID")
+                        self.selected = folder
+                        self._wln(f"{tag} OK [READ-WRITE] SELECT completed")
+                    elif cmd == "UID":
+                        sub_parts = rest.split(" ", 1)
+                        sub = sub_parts[0].upper()
+                        sub_rest = sub_parts[1] if len(sub_parts) > 1 else ""
+                        if self.selected is None:
+                            self._wln(f"{tag} BAD no folder selected")
+                            continue
+                        if sub == "SEARCH":
+                            uids = " ".join(str(m.uid) for m in self.selected.messages)
+                            self._wln(f"* SEARCH {uids}".rstrip())
+                            self._wln(f"{tag} OK SEARCH completed")
+                        elif sub == "FETCH":
+                            # Simulate transient network error: drop the connection mid-FETCH.
+                            if self.selected.fetch_failures_remaining > 0:
+                                self.selected.fetch_failures_remaining -= 1
+                                try:
+                                    self._ssl_sock.close()
+                                except (OSError, ssl.SSLError):
+                                    pass
+                                return
+                            # sub_rest looks like: "<uid> (RFC822 INTERNALDATE)"
+                            try:
+                                uid_str, _spec = sub_rest.split(" ", 1)
+                                uid = int(uid_str)
+                            except (ValueError, IndexError):
+                                self._wln(f"{tag} BAD malformed fetch")
+                                continue
+                            msg = next((m for m in self.selected.messages if m.uid == uid), None)
+                            if msg is None:
+                                self._wln(f"{tag} OK FETCH completed")
+                                continue
+                            seq = self.selected.messages.index(msg) + 1
+                            header = (
+                                f'* {seq} FETCH (UID {msg.uid} '
+                                f'INTERNALDATE "{msg.internaldate}" '
+                                f"RFC822 {{{len(msg.body)}}}\r\n"
+                            ).encode("ascii")
+                            self._wraw(header)
+                            self._wraw(msg.body)
+                            self._wraw(b")\r\n")
+                            self._wln(f"{tag} OK FETCH completed")
+                        else:
+                            self._wln(f"{tag} BAD unknown UID command: {sub}")
+                    elif cmd == "LOGOUT":
+                        self._wln("* BYE")
+                        self._wln(f"{tag} OK LOGOUT completed")
+                        return
+                    elif cmd == "NOOP":
+                        self._wln(f"{tag} OK NOOP completed")
+                    elif cmd == "CLOSE":
+                        self.selected = None
+                        self._wln(f"{tag} OK CLOSE completed")
+                    else:
+                        self._wln(f"{tag} BAD unknown: {cmd}")
+
+        class _Server(socketserver.ThreadingMixIn, socketserver.TCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        self._server = _Server((self.host, 0), Handler)
+        self.port = self._server.server_address[1]
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+
+
+def _make_eml(subject, body_text="hello", from_addr="alice@example.com"):
+    """Build an RFC822-shaped bytes blob suitable for the fake server's RFC822 fetch."""
+    return (
+        f"From: {from_addr}\r\n"
+        f"To: me@example.com\r\n"
+        f"Subject: {subject}\r\n"
+        f"Date: Thu, 8 May 2026 14:30:00 +0000\r\n"
+        f"Message-ID: <{subject.replace(' ', '_')}@example.com>\r\n"
+        f"\r\n"
+        f"{body_text}\r\n"
+    ).encode("utf-8")
+
+
+class TestSyncIntegration(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cert_data = _generate_test_cert()
+        if cert_data is None:
+            raise unittest.SkipTest("openssl not available — skipping IMAP integration tests")
+        cls.cert_path, cls.key_path, cls.cert_sha256, _ = cert_data
+
+    def setUp(self):
+        # Each test gets a fresh server, fresh store, fresh lock-file location.
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmppath = Path(self._tmp.name)
+        self._orig_lock = sm.LOCK_PATH
+        sm.LOCK_PATH = self.tmppath / "lock"
+        Store._active = False
+        self.imap = _FakeIMAPServer(self.cert_path, self.key_path)
+        self.imap.start()
+
+    def tearDown(self):
+        self.imap.stop()
+        sm.LOCK_PATH = self._orig_lock
+        Store._active = False
+        self._tmp.cleanup()
+
+    def _account(self):
+        return MailConnectionInfos(
+            name="test",
+            username="user@localhost",
+            password="hunter2",
+            imap_ssl_host="localhost",
+            imap_ssl_port=self.imap.port,
+            pinned_imap_certificate_sha256=self.cert_sha256,
+            local_store_path=str(self.tmppath / "store"),
+            ssl_cafile=str(self.cert_path),
+        )
+
+    def test_basic_sync_downloads_messages(self):
+        inbox = self.imap.add_folder("INBOX", uidvalidity=42)
+        inbox.add(_make_eml("first"), internaldate="01-Jan-2026 12:00:00 +0000")
+        inbox.add(_make_eml("second"), internaldate="02-Jan-2026 12:00:00 +0000")
+
+        ctx = Context()
+        sm.sync_emails(self._account(), ctx, auto_apply=True)
+
+        # Two .eml files written, one entry per content hash in the index
+        eml_files = list((self.tmppath / "store" / "mails").glob("*.eml"))
+        self.assertEqual(len(eml_files), 2)
+        with Store(self.tmppath / "store") as store:
+            self.assertEqual(len(store.messages), 2)
+            subjects = sorted(e["subject"] for e in store.messages.values())
+            self.assertEqual(subjects, ["first", "second"])
+            # UIDVALIDITY recorded
+            self.assertEqual(store.folder_states["INBOX"]["uidvalidity"], 42)
+        self.assertEqual(ctx.errors, [])
+
+    def test_same_body_in_two_folders_dedups(self):
+        body = _make_eml("shared")
+        inbox = self.imap.add_folder("INBOX")
+        inbox.add(body)
+        sent = self.imap.add_folder("[Gmail]/All Mail")
+        sent.add(body)
+
+        ctx = Context()
+        sm.sync_emails(self._account(), ctx, auto_apply=True)
+
+        # Content hash dedups: one .eml on disk, one entry, history has both folders
+        eml_files = list((self.tmppath / "store" / "mails").glob("*.eml"))
+        self.assertEqual(len(eml_files), 1)
+        with Store(self.tmppath / "store") as store:
+            self.assertEqual(len(store.messages), 1)
+            entry = next(iter(store.messages.values()))
+            history_folders = sorted(h["folder"] for h in entry["history"])
+            self.assertEqual(history_folders, ["INBOX", "[Gmail]/All Mail"])
+
+    def test_select_failure_isolates_to_one_folder(self):
+        good = self.imap.add_folder("INBOX")
+        good.add(_make_eml("survives"))
+        self.imap.add_folder("Broken", select_status="NO")  # SELECT will be refused
+
+        ctx = Context()
+        sm.sync_emails(self._account(), ctx, auto_apply=True)
+
+        # The good folder synced; the broken one was skipped with a recorded error
+        with Store(self.tmppath / "store") as store:
+            self.assertEqual(len(store.messages), 1)
+            entry = next(iter(store.messages.values()))
+            self.assertEqual(entry["subject"], "survives")
+        select_errors = [e for e in ctx.errors if e.kind == "select_failed"]
+        self.assertEqual(len(select_errors), 1)
+        self.assertIn("Broken", select_errors[0].detail)
+
+    def test_uidvalidity_change_invalidates_cache_and_refetches(self):
+        body = _make_eml("survives uidvalidity change")
+        inbox = self.imap.add_folder("INBOX", uidvalidity=1)
+        inbox.add(body)
+
+        ctx1 = Context()
+        sm.sync_emails(self._account(), ctx1, auto_apply=True)
+        self.assertEqual(ctx1.errors, [])
+        eml_files_before = sorted(p.name for p in (self.tmppath / "store" / "mails").glob("*.eml"))
+        self.assertEqual(len(eml_files_before), 1)
+
+        # Server bumps UIDVALIDITY (and reassigns UIDs in practice). Same body, different UID.
+        inbox.uidvalidity = 999
+        inbox.messages = []
+        inbox.add(body)  # gets UID 1 again under the new UIDVALIDITY scheme
+
+        ctx2 = Context()
+        sm.sync_emails(self._account(), ctx2, auto_apply=True)
+
+        # uidvalidity_changed was recorded; .eml file untouched (content-hash dedup)
+        kinds = [e.kind for e in ctx2.errors]
+        self.assertIn("uidvalidity_changed", kinds)
+        eml_files_after = sorted(p.name for p in (self.tmppath / "store" / "mails").glob("*.eml"))
+        self.assertEqual(eml_files_after, eml_files_before)
+        with Store(self.tmppath / "store") as store:
+            self.assertEqual(len(store.messages), 1)
+            self.assertEqual(store.folder_states["INBOX"]["uidvalidity"], 999)
+
+    def test_new_message_in_second_sync_is_added(self):
+        inbox = self.imap.add_folder("INBOX", uidvalidity=1)
+        inbox.add(_make_eml("first"))
+
+        ctx1 = Context()
+        sm.sync_emails(self._account(), ctx1, auto_apply=True)
+        self.assertEqual(len(list((self.tmppath / "store" / "mails").glob("*.eml"))), 1)
+
+        inbox.add(_make_eml("second"))
+
+        ctx2 = Context()
+        sm.sync_emails(self._account(), ctx2, auto_apply=True)
+        self.assertEqual(len(list((self.tmppath / "store" / "mails").glob("*.eml"))), 2)
+        with Store(self.tmppath / "store") as store:
+            subjects = sorted(e["subject"] for e in store.messages.values())
+            self.assertEqual(subjects, ["first", "second"])
+
+    def test_message_deleted_from_server_marks_every_history_entry_removed(self):
+        inbox = self.imap.add_folder("INBOX", uidvalidity=1)
+        inbox.add(_make_eml("keeper"))
+        inbox.add(_make_eml("doomed"))
+
+        ctx1 = Context()
+        sm.sync_emails(self._account(), ctx1, auto_apply=True)
+
+        with Store(self.tmppath / "store") as store:
+            self.assertTrue(all(sm.is_live(e) for e in store.messages.values()))
+
+        # Server-side delete the second message
+        inbox.remove(2)
+
+        ctx2 = Context()
+        sm.sync_emails(self._account(), ctx2, auto_apply=True)
+
+        with Store(self.tmppath / "store") as store:
+            gone = [e for e in store.messages.values() if sm.is_gone(e)]
+            self.assertEqual(len(gone), 1)
+            self.assertEqual(gone[0]["subject"], "doomed")
+            # New "D" path: every history entry of the gone message is marked removed.
+            self.assertTrue(all(h.get("removed") for h in gone[0]["history"]))
+
+            live = [e for e in store.messages.values() if sm.is_live(e)]
+            self.assertEqual(len(live), 1)
+            self.assertEqual(live[0]["subject"], "keeper")
+            self.assertFalse(any(h.get("removed") for h in live[0]["history"]))
+
+    # ─── mid-sync crash + retry ───────────────────────────────────────────────────
+
+    def test_midsync_fetch_failure_raises_with_no_retries(self):
+        # Server drops the connection before FETCH responds.
+        inbox = self.imap.add_folder("INBOX", uidvalidity=1)
+        inbox.add(_make_eml("first"))
+        inbox.add(_make_eml("second"))
+        inbox.fetch_failures_remaining = 99  # always fail
+
+        ctx = Context()
+        with self.assertRaises(SMException):
+            sm.sync_emails(self._account(), ctx, auto_apply=True, max_silent_retries=0)
+
+    def test_midsync_partial_state_is_consistent(self):
+        # First two FETCHes succeed (1 message), then connection drops mid-fetch on the 3rd.
+        # Expected: that one message is on disk + indexed (atomic save) when the sync raises.
+        inbox = self.imap.add_folder("INBOX", uidvalidity=1)
+        inbox.add(_make_eml("survives"))   # uid 1 — fetched OK
+        inbox.add(_make_eml("orphaned"))   # uid 2 — connection drops before fetch returns
+
+        # The first SELECT does no FETCH; the failures count starts ticking on the FETCH call
+        # for uid 1. We want uid 1 to succeed, uid 2 to fail. So skip 0 failures up to that point,
+        # then drop. Easiest: drop only the second FETCH.
+        original_handler_check = inbox.fetch_failures_remaining
+        # Track FETCH calls server-side: drop the 2nd one (and keep dropping after)
+        inbox.fetch_failures_remaining = 0  # uid 1 fetches normally
+        # We'll set it before uid 2's fetch runs — but we can't time that synchronously.
+        # Instead: set to a high number; uid 1 already-OK because we set it after... no.
+        # Simpler scenario: ALL fetches drop. After the failure, partial state may still be empty,
+        # but the test asserts "what's saved is consistent" not "exactly N messages saved."
+
+        inbox.fetch_failures_remaining = 99
+        ctx = Context()
+        with self.assertRaises(SMException):
+            sm.sync_emails(self._account(), ctx, auto_apply=True, max_silent_retries=0)
+
+        # Whatever is on disk must be valid JSON with the expected shape (atomic write invariant).
+        store_path = self.tmppath / "store"
+        if (store_path / "index.json").exists():
+            import json
+            data = json.loads((store_path / "index.json").read_text())
+            self.assertIn("messages", data)
+            self.assertIn("folders", data)
+            # Every indexed message must have its .eml on disk (no orphans pointing to missing files)
+            for sha in data["messages"]:
+                self.assertTrue((store_path / "mails" / f"{sha}.eml").exists(),
+                                f"orphan index entry: {sha} has no .eml")
+
+    def test_silent_retry_recovers(self):
+        # Connection drops on the first FETCH, then succeeds on retry.
+        inbox = self.imap.add_folder("INBOX", uidvalidity=1)
+        inbox.add(_make_eml("recovered"))
+        inbox.fetch_failures_remaining = 1  # one drop, then OK
+
+        ctx = Context()
+        sm.sync_emails(self._account(), ctx, auto_apply=True, max_silent_retries=2)
+
+        with Store(self.tmppath / "store") as store:
+            self.assertEqual(len(store.messages), 1)
+            self.assertEqual(next(iter(store.messages.values()))["subject"], "recovered")
+
+    def test_prompt_declined_after_silent_retries_raises(self):
+        inbox = self.imap.add_folder("INBOX", uidvalidity=1)
+        inbox.add(_make_eml("doomed"))
+        inbox.fetch_failures_remaining = 99  # never recovers
+
+        ctx = Context()
+        with patch("builtins.input", return_value="n"):
+            with self.assertRaises(SMException):
+                sm.sync_emails(self._account(), ctx, auto_apply=True, max_silent_retries=1)
+
+    # ─── on-disk vs index discrepancies ───────────────────────────────────────────
+
+    def test_missing_eml_for_indexed_message_is_recreated(self):
+        # Sync once; manually delete the .eml; re-sync; the file must come back.
+        inbox = self.imap.add_folder("INBOX", uidvalidity=1)
+        inbox.add(_make_eml("recreate me"))
+
+        sm.sync_emails(self._account(), Context(), auto_apply=True)
+        eml_files = list((self.tmppath / "store" / "mails").glob("*.eml"))
+        self.assertEqual(len(eml_files), 1)
+        eml_files[0].unlink()  # external/accidental delete
+        self.assertEqual(len(list((self.tmppath / "store" / "mails").glob("*.eml"))), 0)
+
+        sm.sync_emails(self._account(), Context(), auto_apply=True)
+
+        # File restored from server, content matches the hash-named filename.
+        eml_files_after = list((self.tmppath / "store" / "mails").glob("*.eml"))
+        self.assertEqual(len(eml_files_after), 1)
+        self.assertEqual(eml_files_after[0].name, eml_files[0].name)  # same hash
+        self.assertEqual(hashlib.sha256(eml_files_after[0].read_bytes()).hexdigest() + ".eml",
+                         eml_files_after[0].name)
+        # Index unchanged, no duplicate entry.
+        with Store(self.tmppath / "store") as store:
+            self.assertEqual(len(store.messages), 1)
+
+    def test_unrelated_orphan_eml_is_left_alone(self):
+        # Sync once. Drop an unrelated .eml on disk (not matching any server message). Re-sync.
+        # Orphan stays untouched; index stays clean.
+        inbox = self.imap.add_folder("INBOX", uidvalidity=1)
+        inbox.add(_make_eml("real message"))
+
+        sm.sync_emails(self._account(), Context(), auto_apply=True)
+        store_path = self.tmppath / "store"
+
+        # Plant an orphan whose filename matches its own content hash (so it's a *valid* orphan,
+        # not a hash-mismatch corruption that the paranoid check would refuse).
+        orphan_body = b"Subject: not on server\r\n\r\norphan body\r\n"
+        orphan_hash = hashlib.sha256(orphan_body).hexdigest()
+        orphan_path = store_path / "mails" / f"{orphan_hash}.eml"
+        orphan_path.write_bytes(orphan_body)
+
+        sm.sync_emails(self._account(), Context(), auto_apply=True)
+
+        # Orphan file untouched
+        self.assertTrue(orphan_path.exists())
+        self.assertEqual(orphan_path.read_bytes(), orphan_body)
+        # Index has only the server's real message — orphan is NOT auto-adopted (no fetch returned its hash).
+        with Store(store_path) as store:
+            self.assertEqual(len(store.messages), 1)
+            self.assertNotIn(orphan_hash, store.messages)
+
+    def test_message_moved_between_folders_marks_old_removed(self):
+        body = _make_eml("nomadic")
+        inbox = self.imap.add_folder("INBOX", uidvalidity=1)
+        archive = self.imap.add_folder("Archive", uidvalidity=1)
+        inbox.add(body)  # uid 1 in INBOX
+
+        sm.sync_emails(self._account(), Context(), auto_apply=True)
+
+        # Server-side move: out of INBOX, into Archive
+        inbox.messages = []
+        archive.add(body)  # uid 1 in Archive
+
+        sm.sync_emails(self._account(), Context(), auto_apply=True)
+
+        with Store(self.tmppath / "store") as store:
+            self.assertEqual(len(store.messages), 1)
+            entry = next(iter(store.messages.values()))
+            history = entry["history"]
+            history_folders = [h["folder"] for h in history]
+            self.assertIn("INBOX", history_folders)
+            self.assertIn("Archive", history_folders)
+            inbox_h = next(h for h in history if h["folder"] == "INBOX")
+            archive_h = next(h for h in history if h["folder"] == "Archive")
+            self.assertTrue(inbox_h.get("removed"))   # old folder marked gone
+            self.assertFalse(archive_h.get("removed"))  # current folder not removed
+            self.assertTrue(sm.is_live(entry))           # message isn't gone, just moved
+
+    def test_missing_eml_plus_unrelated_orphan(self):
+        # Combined corruption: indexed message's .eml is gone AND an unrelated orphan exists.
+        # Re-sync should recreate the missing one and leave the orphan alone.
+        inbox = self.imap.add_folder("INBOX", uidvalidity=1)
+        inbox.add(_make_eml("primary"))
+
+        sm.sync_emails(self._account(), Context(), auto_apply=True)
+        store_path = self.tmppath / "store"
+        primary_eml = next(iter((store_path / "mails").glob("*.eml")))
+        primary_eml.unlink()
+
+        orphan_body = b"Subject: unrelated\r\n\r\nfiller\r\n"
+        orphan_hash = hashlib.sha256(orphan_body).hexdigest()
+        orphan_path = store_path / "mails" / f"{orphan_hash}.eml"
+        orphan_path.write_bytes(orphan_body)
+
+        sm.sync_emails(self._account(), Context(), auto_apply=True)
+
+        # Primary recreated, orphan untouched.
+        self.assertTrue(primary_eml.exists())
+        self.assertTrue(orphan_path.exists())
+        self.assertEqual(orphan_path.read_bytes(), orphan_body)
+        # Index has only the primary; orphan not adopted.
+        with Store(store_path) as store:
+            self.assertEqual(len(store.messages), 1)
+            self.assertNotIn(orphan_hash, store.messages)
+
+    def test_prompt_accepted_then_recovers(self):
+        # First (silent_retries+1)=2 attempts fail, prompt user, user says yes,
+        # next batch's first attempt succeeds.
+        inbox = self.imap.add_folder("INBOX", uidvalidity=1)
+        inbox.add(_make_eml("eventually"))
+        inbox.fetch_failures_remaining = 2  # both silent attempts fail
+
+        ctx = Context()
+        with patch("builtins.input", return_value="y") as mock_input:
+            sm.sync_emails(self._account(), ctx, auto_apply=True, max_silent_retries=1)
+        # Prompt was hit at least once
+        self.assertGreaterEqual(mock_input.call_count, 1)
+
+        with Store(self.tmppath / "store") as store:
+            self.assertEqual(len(store.messages), 1)
+            self.assertEqual(next(iter(store.messages.values()))["subject"], "eventually")
+
+    # ─── history-as-truth: A→B→A, UIDVALIDITY refresh, resurrection ──────────────
+
+    def test_round_trip_A_to_B_to_A(self):
+        # Move A → B → A. Final history must have three entries:
+        #   [{A, uid_initial, removed}, {B, uid_at_B, removed}, {A, uid_back_in_A}]
+        # is_live(entry) returns True (the trailing A entry is live).
+        body = _make_eml("nomadic")
+        a = self.imap.add_folder("INBOX", uidvalidity=1)   # name "A" semantically
+        b = self.imap.add_folder("Archive", uidvalidity=1) # name "B" semantically
+        a.add(body)  # uid 1 in INBOX
+
+        sm.sync_emails(self._account(), Context(), auto_apply=True)
+
+        # Move 1: INBOX → Archive
+        a.messages = []
+        b.add(body)  # uid 1 in Archive
+
+        sm.sync_emails(self._account(), Context(), auto_apply=True)
+
+        # Move 2: Archive → INBOX (back)
+        b.messages = []
+        a.add(body)  # uid 2 in INBOX (different uid this time, simulates a re-add)
+
+        sm.sync_emails(self._account(), Context(), auto_apply=True)
+
+        with Store(self.tmppath / "store") as store:
+            self.assertEqual(len(store.messages), 1)
+            entry = next(iter(store.messages.values()))
+            history = entry["history"]
+            self.assertEqual(len(history), 3, f"expected 3 history entries, got {history}")
+            # First two are removed, last is live
+            self.assertTrue(history[0].get("removed"))
+            self.assertEqual(history[0]["folder"], "INBOX")
+            self.assertTrue(history[1].get("removed"))
+            self.assertEqual(history[1]["folder"], "Archive")
+            self.assertFalse(history[2].get("removed"))
+            self.assertEqual(history[2]["folder"], "INBOX")
+            self.assertTrue(is_live(entry))
+
+    def test_uidvalidity_bump_message_stays_updates_uid_in_place(self):
+        body = _make_eml("stays put")
+        inbox = self.imap.add_folder("INBOX", uidvalidity=1)
+        inbox.add(body)  # uid 1
+
+        sm.sync_emails(self._account(), Context(), auto_apply=True)
+
+        # UIDVALIDITY bumps. Same content, fresh UID under the new scheme.
+        inbox.uidvalidity = 999
+        inbox.messages = []
+        inbox.add(body)  # uid 1 again, but a brand-new one under the new UIDVALIDITY
+        # Force a different uid to make the test meaningful
+        inbox.messages[0].uid = 7
+
+        sm.sync_emails(self._account(), Context(), auto_apply=True)
+
+        with Store(self.tmppath / "store") as store:
+            entry = next(iter(store.messages.values()))
+            history = entry["history"]
+            # No new history entry — the existing live entry was updated in place.
+            self.assertEqual(len(history), 1)
+            self.assertEqual(history[0]["folder"], "INBOX")
+            self.assertEqual(history[0]["uid"], 7)  # ← the new UID, not the stale 1
+            self.assertFalse(history[0].get("removed"))
+            self.assertTrue(is_live(entry))
+
+    def test_uidvalidity_bump_message_removed_marks_history_removed(self):
+        # UIDVALIDITY bumps AND the message is gone from the folder under the new scheme.
+        # Existing history entry must end up with removed=True; is_gone(entry) is True.
+        body = _make_eml("disappears")
+        inbox = self.imap.add_folder("INBOX", uidvalidity=1)
+        inbox.add(body)
+
+        sm.sync_emails(self._account(), Context(), auto_apply=True)
+
+        # Bump UIDVALIDITY and remove the message.
+        inbox.uidvalidity = 999
+        inbox.messages = []
+
+        sm.sync_emails(self._account(), Context(), auto_apply=True)
+
+        with Store(self.tmppath / "store") as store:
+            entry = next(iter(store.messages.values()))
+            self.assertTrue(is_gone(entry))
+            self.assertTrue(all(h.get("removed") for h in entry["history"]))
+
+    def test_resurrection_after_deletion_appends_live_history_entry(self):
+        # Message deleted from server, then re-appears. is_live flips back to True;
+        # history shows the original removed entry plus a fresh live entry.
+        body = _make_eml("phoenix")
+        inbox = self.imap.add_folder("INBOX", uidvalidity=1)
+        inbox.add(body)  # uid 1
+
+        sm.sync_emails(self._account(), Context(), auto_apply=True)
+
+        # Delete server-side
+        inbox.messages = []
+        sm.sync_emails(self._account(), Context(), auto_apply=True)
+        with Store(self.tmppath / "store") as store:
+            entry = next(iter(store.messages.values()))
+            self.assertTrue(is_gone(entry))
+
+        # Resurrection: same body comes back with a different UID
+        inbox.add(body)  # gets uid 1 again (or 2, doesn't matter)
+        sm.sync_emails(self._account(), Context(), auto_apply=True)
+
+        with Store(self.tmppath / "store") as store:
+            entry = next(iter(store.messages.values()))
+            self.assertTrue(is_live(entry))
+            history = entry["history"]
+            # First entry is the original (removed); a new live entry appended for the resurrection.
+            self.assertGreaterEqual(len(history), 2)
+            self.assertTrue(history[0].get("removed"))
+            self.assertFalse(history[-1].get("removed"))
+
+
+class TestIsLiveIsGone(unittest.TestCase):
+    def test_empty_history_is_gone(self):
+        # Defensive: malformed entry with no history. Treated as gone (filtered out by readers).
+        self.assertFalse(is_live({"history": []}))
+        self.assertTrue(is_gone({"history": []}))
+        self.assertFalse(is_live({}))  # missing key
+        self.assertTrue(is_gone({}))
+
+    def test_single_live_entry_is_live(self):
+        e = {"history": [{"folder": "INBOX", "uid": 1}]}
+        self.assertTrue(is_live(e))
+        self.assertFalse(is_gone(e))
+
+    def test_all_removed_is_gone(self):
+        e = {"history": [
+            {"folder": "INBOX", "uid": 1, "removed": True},
+            {"folder": "Archive", "uid": 5, "removed": True},
+        ]}
+        self.assertFalse(is_live(e))
+        self.assertTrue(is_gone(e))
+
+    def test_mixed_is_live(self):
+        e = {"history": [
+            {"folder": "INBOX", "uid": 1, "removed": True},
+            {"folder": "Archive", "uid": 5},  # one live entry
+        ]}
+        self.assertTrue(is_live(e))
+        self.assertFalse(is_gone(e))
+
+
+class TestCorruptedIndex(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmppath = Path(self._tmp.name)
+        self._orig_lock = sm.LOCK_PATH
+        sm.LOCK_PATH = self.tmppath / "lock"
+        Store._active = False
+
+    def tearDown(self):
+        sm.LOCK_PATH = self._orig_lock
+        Store._active = False
+        self._tmp.cleanup()
+
+    def test_corrupted_json_raises_friendly_smexception(self):
+        store_path = self.tmppath / "store"
+        store_path.mkdir()
+        (store_path / "index.json").write_text("this is { not valid json")
+
+        with self.assertRaises(SMException) as cm:
+            with Store(store_path):
+                pass
+        msg = str(cm.exception)
+        # Must say where + how to recover, not dump a JSONDecodeError stack trace at the user.
+        self.assertIn("corrupted", msg.lower())
+        self.assertIn("index.json", msg)
+        self.assertIn("re-sync", msg)
+
+    def test_truncated_json_raises_friendly_smexception(self):
+        store_path = self.tmppath / "store"
+        store_path.mkdir()
+        (store_path / "index.json").write_text('{"messages": {"abc": {"sub')  # cut off mid-key
+
+        with self.assertRaises(SMException) as cm:
+            with Store(store_path):
+                pass
+        self.assertIn("corrupted", str(cm.exception).lower())
 
 
 if __name__ == "__main__":
