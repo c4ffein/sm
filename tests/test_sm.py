@@ -1775,6 +1775,267 @@ class TestSyncIntegration(unittest.TestCase):
             self.assertFalse(history[-1].get("removed"))
 
 
+class TestReadUIErrorRecording(unittest.TestCase):
+    """End-to-end coverage of the read UI's error-handling story: each recoverable failure
+    mode (missing .eml, parse exception, attachment-walk exception) lands as a `read_failed`
+    ErrorEvent and is reachable via the [e]rrors action — the UI never crashes on these.
+
+    Drives `sm.main()` with patched argv + stubbed config + scripted stdin, observing the
+    full output. The only "don't even try to load the UI" failure is a corrupted index.json,
+    covered separately by TestCorruptedIndex."""
+
+    def setUp(self):
+        import json
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmppath = Path(self._tmp.name)
+        # Save + override module-level globals that main() touches
+        self._orig_lock = sm.LOCK_PATH
+        self._orig_config = sm.CONFIG_PATH
+        self._orig_argv = sm.argv
+        sm.LOCK_PATH = self.tmppath / "lock"
+        sm.CONFIG_PATH = self.tmppath / "config.json"
+        Store._active = False
+        # Build a minimal config — only fields read_emails actually uses
+        config = {"accounts": [{"name": "test", "local_store_path": str(self.tmppath / "store")}]}
+        sm.CONFIG_PATH.write_text(json.dumps(config))
+
+    def tearDown(self):
+        sm.LOCK_PATH = self._orig_lock
+        sm.CONFIG_PATH = self._orig_config
+        sm.argv = self._orig_argv
+        Store._active = False
+        self._tmp.cleanup()
+
+    def _populate_one(self, eml_bytes=None):
+        """Index one message into the store. Returns its content hash."""
+        body = eml_bytes if eml_bytes is not None else _make_eml("subject A")
+        with Store(self.tmppath / "store") as store:
+            content_hash = hashlib.sha256(body).hexdigest()
+            (store.mails_path / f"{content_hash}.eml").write_bytes(body)
+            store.messages[content_hash] = {
+                "subject": "subject A",
+                "from": "alice@example.com",
+                "date": "Thu, 8 May 2026 14:30:00 +0000",
+                "internaldate": "08-May-2026 14:30:00 +0000",
+                "history": [{"folder": "INBOX", "uid": 1}],
+            }
+            store.save()
+        return content_hash
+
+    def _run_main_read(self, inputs):
+        """Run sm.main() with action=read, scripted stdin. Returns captured stdout."""
+        sm.argv = ["sm", "read", "account=test"]
+        buf = io.StringIO()
+        with patch("builtins.input", side_effect=inputs):
+            with redirect_stdout(buf):
+                sm.main()
+        return buf.getvalue()
+
+    def test_missing_eml_records_and_surfaces_via_errors_screen(self):
+        content_hash = self._populate_one()
+        # Manual delete of the .eml: simulates a corrupted store / lost file
+        (self.tmppath / "store" / "mails" / f"{content_hash}.eml").unlink()
+
+        # Sequence: try to read entry 1 → fails inline → press [e] → return → [q]uit
+        out = self._run_main_read(["1", "e", "", "q"])
+
+        # UI didn't crash — we got the inline failure message
+        self.assertIn("Failed to load email", out)
+        # Error reached the [e]rrors action with the expected kind + identifying detail
+        self.assertIn("[read_failed]", out)
+        self.assertIn("missing", out.lower())
+        self.assertIn(content_hash[:12], out)
+
+    def test_parse_exception_records_and_surfaces_via_errors_screen(self):
+        self._populate_one()
+        # Force the parse step to raise: this simulates a corrupt .eml that message_from_bytes
+        # can't handle. (In practice message_from_bytes is very permissive, so we mock it.)
+        with patch("sm.message_from_bytes", side_effect=ValueError("malformed envelope")):
+            out = self._run_main_read(["1", "e", "", "q"])
+
+        self.assertIn("Failed to load email", out)
+        self.assertIn("[read_failed]", out)
+        self.assertIn("ValueError", out)
+        self.assertIn("malformed envelope", out)
+
+    def test_attachment_walk_exception_records_and_surfaces_via_errors_screen(self):
+        self._populate_one()
+        # Attachment listing crashes (rare, but list_attachments walks an arbitrary tree).
+        with patch("sm.list_attachments", side_effect=RuntimeError("walk blew up")):
+            out = self._run_main_read(["1", "e", "", "q"])
+
+        self.assertIn("Failed to load email", out)
+        self.assertIn("[read_failed]", out)
+        self.assertIn("RuntimeError", out)
+        self.assertIn("walk blew up", out)
+
+
+class TestShowErrorsScreen(unittest.TestCase):
+    """The full-detail error screen used by the read UI's [e]rrors action.
+    Always shows full per-event detail (verbosity-independent — the user explicitly
+    asked to see them). The interactive 'press Enter' wait is patched out."""
+
+    def test_no_errors_says_so(self):
+        ctx = Context()
+        buf = io.StringIO()
+        with redirect_stdout(buf), patch("builtins.input", return_value=""):
+            sm._show_errors_screen(ctx, term_width=80)
+        out = buf.getvalue()
+        self.assertIn("No errors recorded", out)
+
+    def test_groups_by_kind_with_count_and_details(self):
+        ctx = Context()
+        ctx.record_error("parse_list", "first detail")
+        ctx.record_error("parse_list", "second detail")
+        ctx.record_error("select_failed", "third detail")
+        buf = io.StringIO()
+        with redirect_stdout(buf), patch("builtins.input", return_value=""):
+            sm._show_errors_screen(ctx, term_width=80)
+        out = buf.getvalue()
+        # Group headers with proper plural/singular labels
+        self.assertIn("[parse_list] 2 entries:", out)
+        self.assertIn("[select_failed] 1 entry:", out)
+        # Each detail shown verbatim
+        self.assertIn("first detail", out)
+        self.assertIn("second detail", out)
+        self.assertIn("third detail", out)
+
+    def test_kinds_grouped_alphabetically(self):
+        ctx = Context()
+        ctx.record_error("zzz", "z")
+        ctx.record_error("aaa", "a")
+        ctx.record_error("mmm", "m")
+        buf = io.StringIO()
+        with redirect_stdout(buf), patch("builtins.input", return_value=""):
+            sm._show_errors_screen(ctx, term_width=80)
+        out = buf.getvalue()
+        self.assertLess(out.index("[aaa]"), out.index("[mmm]"))
+        self.assertLess(out.index("[mmm]"), out.index("[zzz]"))
+
+    def test_visible_at_default_quiet_verbosity(self):
+        # Unlike _summarize_errors which gates details by verbosity, this screen always shows
+        # full detail because the user invoked it intentionally (verbosity is irrelevant here).
+        ctx = Context()  # default = Verbosity.ERROR (most quiet)
+        ctx.record_error("parse_list", "should still be visible")
+        buf = io.StringIO()
+        with redirect_stdout(buf), patch("builtins.input", return_value=""):
+            sm._show_errors_screen(ctx, term_width=80)
+        self.assertIn("should still be visible", buf.getvalue())
+
+
+class TestSummarizeErrors(unittest.TestCase):
+    def test_no_errors_silent(self):
+        ctx = Context(param=Param(verbosity=Verbosity.DEBUG))  # max verbosity, still no output
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            sm._summarize_errors(ctx)
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_summary_visible_at_default_verbosity(self):
+        # Default Verbosity.ERROR is the most quiet. The error summary must still surface
+        # because the user needs to know things went wrong; uses Verbosity.ERROR-level log.
+        ctx = Context()
+        ctx.record_error("parse_list", "first")
+        ctx.record_error("parse_list", "second")
+        ctx.record_error("select_failed", "third")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            sm._summarize_errors(ctx)
+        out = buf.getvalue()
+        self.assertIn("3 issue(s)", out)
+        self.assertIn("parse_list (2)", out)
+        self.assertIn("select_failed (1)", out)
+        self.assertIn("verbose=2", out)
+        # Per-event details are NOT visible at default verbosity — only at DEBUG.
+        self.assertNotIn("first", out)
+        self.assertNotIn("second", out)
+        self.assertNotIn("third", out)
+
+    def test_details_visible_at_debug(self):
+        ctx = Context(param=Param(verbosity=Verbosity.DEBUG))
+        ctx.record_error("parse_list", "first detail")
+        ctx.record_error("select_failed", "second detail")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            sm._summarize_errors(ctx)
+        out = buf.getvalue()
+        self.assertIn("first detail", out)
+        self.assertIn("second detail", out)
+        # The verbose=2 hint is suppressed when we're already at DEBUG.
+        self.assertNotIn("verbose=2", out)
+
+    def test_kinds_grouped_alphabetically(self):
+        ctx = Context()
+        ctx.record_error("zzz", "z")
+        ctx.record_error("aaa", "a")
+        ctx.record_error("mmm", "m")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            sm._summarize_errors(ctx)
+        out = buf.getvalue()
+        self.assertLess(out.index("aaa"), out.index("mmm"))
+        self.assertLess(out.index("mmm"), out.index("zzz"))
+
+
+class TestSyncEmailsIsProducerOnly(unittest.TestCase):
+    """sync_emails appends to ctx.errors but does NOT render a summary itself. The caller
+    (e.g. main, or a test harness) is the consumer. Pre-existing entries are preserved
+    across calls; nothing about ctx.errors is mutated except by the recording sites."""
+
+    @classmethod
+    def setUpClass(cls):
+        cert_data = _generate_test_cert()
+        if cert_data is None:
+            raise unittest.SkipTest("openssl not available")
+        cls.cert_path, cls.key_path, cls.cert_sha256, _ = cert_data
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmppath = Path(self._tmp.name)
+        self._orig_lock = sm.LOCK_PATH
+        sm.LOCK_PATH = self.tmppath / "lock"
+        Store._active = False
+        self.imap = _FakeIMAPServer(self.cert_path, self.key_path)
+        self.imap.start()
+
+    def tearDown(self):
+        self.imap.stop()
+        sm.LOCK_PATH = self._orig_lock
+        Store._active = False
+        self._tmp.cleanup()
+
+    def _account(self):
+        return MailConnectionInfos(
+            name="t", username="u", password="p",
+            imap_ssl_host="localhost", imap_ssl_port=self.imap.port,
+            pinned_imap_certificate_sha256=self.cert_sha256,
+            local_store_path=str(self.tmppath / "store"),
+            ssl_cafile=str(self.cert_path),
+        )
+
+    def test_pre_existing_errors_preserved(self):
+        ctx = Context()
+        ctx.record_error("stale_from_prior_run", "should NOT be discarded")
+        self.imap.add_folder("INBOX")
+        self.imap.folders["INBOX"].add(_make_eml("clean"))
+        sm.sync_emails(self._account(), ctx, auto_apply=True)
+        self.assertEqual(len(ctx.errors), 1)
+        self.assertEqual(ctx.errors[0].kind, "stale_from_prior_run")
+
+    def test_does_not_render_error_summary(self):
+        # Producer-only: sync_emails must never print the "N issue(s) during sync" digest itself.
+        # That's the caller's job (currently main(), see the try/finally around the sync action).
+        ctx = Context()
+        ctx.record_error("from_other_account", "pre-existing")
+        self.imap.add_folder("INBOX")
+        self.imap.folders["INBOX"].add(_make_eml("clean"))
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            sm.sync_emails(self._account(), ctx, auto_apply=True)
+        self.assertNotIn("issue(s) during sync", buf.getvalue())
+
+
 class TestIsLiveIsGone(unittest.TestCase):
     def test_empty_history_is_gone(self):
         # Defensive: malformed entry with no history. Treated as gone (filtered out by readers).
