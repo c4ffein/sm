@@ -11,27 +11,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-        with:
-          python-version: "3.12"
-      - run: uv pip install --system -r pyproject.toml --extra dev
-      - run: make lint-check
+      - run: curl -LsSf https://astral.sh/uv/install.sh | sh
+      - run: echo "$HOME/.local/bin" >> $GITHUB_PATH
+      - run: uv venv --python 3.12
+      - run: uv pip install -r pyproject.toml --extra dev
+      - run: . .venv/bin/activate && make lint-check
 
   format:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-        with:
-          python-version: "3.12"
-      - run: uv pip install --system -r pyproject.toml --extra dev
-      - run: make format-check
+      - run: curl -LsSf https://astral.sh/uv/install.sh | sh
+      - run: echo "$HOME/.local/bin" >> $GITHUB_PATH
+      - run: uv venv --python 3.12
+      - run: uv pip install -r pyproject.toml --extra dev
+      - run: . .venv/bin/activate && make format-check
 
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-        with:
-          python-version: "3.12"
-      - run: make test
+      - run: curl -LsSf https://astral.sh/uv/install.sh | sh
+      - run: echo "$HOME/.local/bin" >> $GITHUB_PATH
+      - run: uv venv --python 3.12
+      - run: . .venv/bin/activate && make test
