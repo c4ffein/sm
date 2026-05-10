@@ -680,7 +680,10 @@ def sync_emails(account: MailConnectionInfos, ctx: Context, auto_apply=False, ma
     cleanly because saves are atomic — partial progress on disk is consistent and the next attempt
     resumes from there). After silent retries are exhausted, prompt the user `Retry? [y/N]`. Saying
     yes runs another batch of silent retries; saying no re-raises the last exception. Set
-    max_silent_retries=0 for no retry at all (e.g., in tests, or to fail fast)."""
+    max_silent_retries=0 for no retry at all (e.g., in tests, or to fail fast).
+
+    Producer-only: appends to ctx.errors as things go wrong. The caller (e.g. main) decides when
+    and how to render those — see _summarize_errors."""
     while True:
         last_exc = None
         for attempt in range(max_silent_retries + 1):
@@ -808,7 +811,25 @@ def _sync_apply(account, store, server_state, new_count, auto_apply, ctx):
 
     store.save()
     ctx.log(f"  Applied: {len(deletions)} deletion(s), {len(moves)} move(s).", Verbosity.INFO)
-    # TODO: surface ctx.errors here — e.g. "N folders skipped (run with verbose=2 for details)" grouped by ErrorEvent.kind.
+
+
+def _summarize_errors(ctx):
+    """Render `ctx.errors` for the user — one-line grouped count always (Verbosity.ERROR so it's
+    visible at every verbosity level), per-event detail lines at DEBUG. Hint to bump verbosity
+    is appended at less-than-DEBUG so the user knows where to look for specifics."""
+    if not ctx.errors:
+        return
+    by_kind = {}
+    for e in ctx.errors:
+        by_kind.setdefault(e.kind, []).append(e)
+    parts = [f"{kind} ({len(events)})" for kind, events in sorted(by_kind.items())]
+    summary = f"  {len(ctx.errors)} issue(s) during sync: {', '.join(parts)}"
+    if ctx.param.verbosity != Verbosity.DEBUG:
+        summary += " — run with verbose=2 for details"
+    ctx.log(summary, Verbosity.ERROR)
+    for kind in sorted(by_kind):
+        for e in by_kind[kind]:
+            ctx.log(f"    [{kind}] {e.detail}", Verbosity.DEBUG)
 
 
 
@@ -949,12 +970,58 @@ def _save_attachment_action(attachments):
     print(f"  Saved: {target}")
 
 
-def read_emails(account: MailConnectionInfos):
+def read_emails(account: MailConnectionInfos, ctx: Context):
     with Store(account.local_store_path) as store:
-        _read_emails_ui(account, store)
+        _read_emails_ui(account, store, ctx)
 
 
-def _read_emails_ui(account, store):
+def _load_message_for_display(content_hash, store, ctx):
+    """Load the .eml + parse + list attachments for one message. Recoverable failures (missing
+    file, read I/O, parse error, attachment-walk crash) are recorded as `read_failed` ErrorEvents
+    and returned as None — the UI loop continues. Returns (msg, attachments) on success."""
+    eml_path = store.mails_path / f"{content_hash}.eml"
+    if not eml_path.exists():
+        ctx.record_error(
+            "read_failed",
+            f"missing .eml for {content_hash[:12]}: {eml_path}",
+        )
+        return None
+    try:
+        with eml_path.open("rb") as f:
+            msg = message_from_bytes(f.read())
+        return msg, list_attachments(msg)
+    except Exception as exc:
+        ctx.record_error(
+            "read_failed",
+            f"failed to load .eml for {content_hash[:12]}: {type(exc).__name__}: {exc}",
+        )
+        return None
+
+
+def _show_errors_screen(ctx, term_width):
+    """Display all `ctx.errors` with full per-event detail, regardless of verbosity.
+    User explicitly asked to see them by hitting [e], so verbosity gating doesn't apply."""
+    print(f"\n{'═' * term_width}")
+    if not ctx.errors:
+        print("  No errors recorded.")
+    else:
+        by_kind = {}
+        for e in ctx.errors:
+            by_kind.setdefault(e.kind, []).append(e)
+        for kind, events in sorted(by_kind.items()):
+            label = f"{len(events)} entr{'y' if len(events) == 1 else 'ies'}"
+            print(f"  [{kind}] {label}:")
+            for e in events:
+                print(f"    {safe_str(e.detail, allow_newlines=False)}")
+    print(f"{'═' * term_width}")
+    print("  Press Enter to return")
+    try:
+        input()
+    except EOFError:
+        pass
+
+
+def _read_emails_ui(account, store, ctx):
     if not store.messages:
         raise SMException(f"No emails found for account {account.name}. Run sync first.")
 
@@ -993,7 +1060,11 @@ def _read_emails_ui(account, store):
             print(f"{prefix}{subj}")
 
         print(f"{'─' * term_width}")
-        print("  [number] read  |  [n]ext  [p]rev  [q]uit")
+        actions = "  [number] read  |  [n]ext  [p]rev"
+        if ctx.errors:
+            actions += f"  |  [e]rrors ({len(ctx.errors)})"
+        actions += "  |  [q]uit"
+        print(actions)
 
         try:
             cmd = input("\n> ").strip().lower()
@@ -1008,18 +1079,17 @@ def _read_emails_ui(account, store):
         elif cmd == "p":
             if page > 0:
                 page -= 1
+        elif cmd == "e" and ctx.errors:
+            _show_errors_screen(ctx, term_width)
         elif cmd.isdigit():
             idx = int(cmd) - 1
             if 0 <= idx < len(entries):
                 content_hash, entry = entries[idx]
-                eml_path = store.mails_path / f"{content_hash}.eml"
-                if not eml_path.exists():
-                    print(f"  Email file not found: {eml_path}")
+                loaded = _load_message_for_display(content_hash, store, ctx)
+                if loaded is None:
+                    print("  Failed to load email — recorded; press [e] to view details.")
                     continue
-
-                with eml_path.open("rb") as f:
-                    msg = message_from_bytes(f.read())
-                attachments = list_attachments(msg)
+                msg, attachments = loaded
 
                 print(f"\n{'═' * term_width}")
                 print(f"  From:    {safe_str(entry.get('from', ''), allow_newlines=False)}")
@@ -1174,12 +1244,15 @@ def main():
             args["recipients"], args["subject"], args["body"], ctx, args["files"],
         )
     elif args["action"] == "sync":
-        for account in resolve_accounts(mail_connections_infos, args["account"]):
-            sync_emails(account, ctx, auto_apply=args["auto_apply"])
+        try:
+            for account in resolve_accounts(mail_connections_infos, args["account"]):
+                sync_emails(account, ctx, auto_apply=args["auto_apply"])
+        finally:
+            _summarize_errors(ctx)  # cumulative across all accounts; fires on success and exception alike
     elif args["action"] == "read":
         accounts = resolve_accounts(mail_connections_infos, args["account"])
         if len(accounts) == 1:
-            read_emails(accounts[0])
+            read_emails(accounts[0], ctx)
         else:
             names = ", ".join(m.name for m in accounts)
             raise SMException(f"Multiple accounts configured. Specify one with account=name\nAvailable: {names}")
