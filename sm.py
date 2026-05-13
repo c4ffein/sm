@@ -5,6 +5,11 @@ sm - Simple Mail client
 MIT License - Copyright (c) 2025 c4ffein
 WARNING: I don't recommand using this as-is. This a PoC, and usable by me because I know what I want to do with it.
 - You can use it if you feel that you can edit the code yourself and you can live with my future breaking changes.
+
+Possible improvements (where to start if sync feels slow):
+- Batched FETCH (UID FETCH 1:100 ...) instead of one body at a time — biggest single win on initial sync.
+- Message-ID prefetch on UIDVALIDITY mismatch to skip re-downloading bodies we already have on disk.
+- Other ideas: IDLE (push), COMPRESS=DEFLATE, CONDSTORE (flag changes), STATUS probe before SELECT, lazy body fetch.
 """
 
 import base64
@@ -46,6 +51,9 @@ from urllib.error import HTTPError
 
 CONFIG_PATH = Path.home() / ".config" / "sm" / "config.json"
 LOCK_PATH = Path.home() / ".config" / "sm" / ".lock"
+
+SYNC_BATCH_SIZE = 50  # UIDs per FETCH — trades round-trips for response memory peak.
+SYNC_BATCH_BYTES = 50 * 1024 * 1024  # Max bytes per batched FETCH response. Cap on peak memory.
 
 colors = {"RED": "31", "GREEN": "32", "PURP": "34", "DIM": "90", "WHITE": "39"}
 Color = Enum("Color", [(k, f"\033[{v}m") for k, v in colors.items()])
@@ -113,6 +121,84 @@ def decoded_header(msg, name, default=""):
         return "".join(out)
     except Exception:
         return str(raw)
+
+
+def parse_size_response(data):
+    """Parse an imaplib FETCH (RFC822.SIZE) response into ({uid: size_bytes}, [error_details]).
+
+    Size-only responses don't include literals, so each per-message line arrives as plain bytes
+    (no tuple). Defensive against tuples just in case some server emits them. Entries that don't
+    match the expected shape are reported in the errors list rather than silently dropped."""
+    sizes = {}
+    errors = []
+    for part in data:
+        if isinstance(part, tuple):
+            part = part[0]
+        if not isinstance(part, bytes):
+            errors.append(f"non-bytes entry: {type(part).__name__}")
+            continue
+        text = part.decode("ascii", errors="replace")
+        uid_match = re.search(r"\bUID (\d+)", text)
+        size_match = re.search(r"\bRFC822\.SIZE (\d+)", text)
+        if uid_match and size_match:
+            sizes[int(uid_match.group(1))] = int(size_match.group(1))
+        else:
+            errors.append(f"line missing UID or RFC822.SIZE: {text[:80]!r}")
+    return sizes, errors
+
+
+def pack_fetch_batches(to_fetch, sizes, max_count, max_bytes):
+    """Greedy-pack UIDs into batches respecting both count and byte caps.
+    A single message larger than max_bytes is fetched alone in its own batch
+    (we still need it; nothing else gets to ride along). Missing sizes count as 0,
+    so byte cap silently degrades to count-only when the size pre-flight is unavailable."""
+    batch = []
+    batch_bytes = 0
+    for uid in to_fetch:
+        size = sizes.get(uid, 0)
+        if batch and (len(batch) >= max_count or batch_bytes + size > max_bytes):
+            yield batch
+            batch = []
+            batch_bytes = 0
+        batch.append(uid)
+        batch_bytes += size
+    if batch:
+        yield batch
+
+
+def parse_fetch_response(data):
+    """Parse an imaplib FETCH response into ([(uid, raw_email, internaldate), ...], [error_details]).
+
+    `data` is the second element of mail.uid("FETCH", ...) — a list with one (header_bytes, body_bytes)
+    tuple per message and trailing b')' separators. Tolerant of unexpected ordering: UID is read from
+    each tuple's header rather than inferred from request order. The trailing b')' is normal response
+    shape and silently skipped; anything else that doesn't yield a UID is reported in the errors list."""
+    results = []
+    errors = []
+    for part in data:
+        if not isinstance(part, tuple):
+            if part != b")":  # normal separator between per-message responses; not an error
+                errors.append(f"unexpected non-tuple entry: {part!r}"[:120])
+            continue
+        header_bytes, body = part[0], part[1]
+        if isinstance(header_bytes, bytes):
+            header = header_bytes.decode("ascii", errors="replace")
+        else:
+            header = str(header_bytes)
+        uid_match = re.search(r"\bUID (\d+)", header)
+        if not uid_match:
+            errors.append(f"tuple missing UID: {header[:80]!r}")
+            continue
+        uid = int(uid_match.group(1))
+        internaldate = ""
+        idx = header.find('INTERNALDATE "')
+        if idx >= 0:
+            start = idx + 14
+            end = header.find('"', start)
+            if end > start:
+                internaldate = header[start:end]
+        results.append((uid, body, internaldate))
+    return results, errors
 
 
 ALLOWED_NAME_CHARS = "qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM0123456789.-_"
@@ -649,28 +735,55 @@ def _fetch_all_emails(account: MailConnectionInfos, store: Store, ctx: Context):
             uids = [int(s) for s in data[0].split()]
             print(f"  {safe_str(folder, allow_newlines=False)}: {len(uids)} email(s)")
 
-            for i, uid in enumerate(uids, 1):
+            # Partition UIDs into already-cached (skip) vs to-fetch (batched FETCH below).
+            to_fetch = []
+            done = 0
+            for uid in uids:
                 cached_hash = known_uids.get((folder, uid))
                 if cached_hash and (store.mails_path / f"{cached_hash}.eml").exists():
                     server_state.setdefault(cached_hash, []).append({"folder": folder, "uid": uid})
-                    print(f"\r    {i}/{len(uids)}", end="", flush=True)
-                    continue
+                    done += 1
+                else:
+                    to_fetch.append(uid)
+            if uids:
+                print(f"\r    {done}/{len(uids)}", end="", flush=True)
 
-                result, data = mail.uid("fetch", str(uid), "(RFC822 INTERNALDATE)")
-                for response_part in data:
-                    if not isinstance(response_part, tuple):
-                        continue
-                    raw_email = response_part[1]
+            # Pre-flight size lookup so we can cap each batch by bytes (peak memory) as well as count.
+            # Skipped when there's nothing to fetch — keeps no-op syncs free of extra round-trips.
+            sizes = {}
+            if to_fetch:
+                size_set = ",".join(str(u) for u in to_fetch)
+                _result, size_data = mail.uid("fetch", size_set, "(RFC822.SIZE)")
+                sizes, size_parse_errors = parse_size_response(size_data)
+                for detail in size_parse_errors:
+                    ctx.record_error("size_parse_error", f"folder {folder!r}: {detail}")
+                if len(sizes) < len(to_fetch):
+                    # Missing sizes silently degrade the byte cap (treated as 0); surface it.
+                    ctx.record_error(
+                        "size_preflight_incomplete",
+                        f"folder {folder!r}: requested sizes for {len(to_fetch)} UIDs, got {len(sizes)}",
+                    )
+
+            for batch in pack_fetch_batches(to_fetch, sizes, SYNC_BATCH_SIZE, SYNC_BATCH_BYTES):
+                uid_set = ",".join(str(u) for u in batch)
+                result, data = mail.uid("fetch", uid_set, "(RFC822 INTERNALDATE)")
+                parsed, parse_errors = parse_fetch_response(data)
+                for detail in parse_errors:
+                    ctx.record_error("fetch_parse_error", f"folder {folder!r}: {detail}")
+                if len(parsed) < len(batch):
+                    # Missing messages self-heal next sync (still in to_fetch), but record so the user sees it.
+                    got_uids = {u for u, _, _ in parsed}
+                    missing = [u for u in batch if u not in got_uids]
+                    preview = missing[:10]
+                    suffix = "..." if len(missing) > 10 else ""
+                    ctx.record_error(
+                        "fetch_incomplete",
+                        f"folder {folder!r}: requested {len(batch)} UIDs, got {len(parsed)} "
+                        f"(missing: {preview}{suffix})",
+                    )
+                for uid, raw_email, internaldate in parsed:
                     content_hash = sha256(raw_email).hexdigest()
-
                     server_state.setdefault(content_hash, []).append({"folder": folder, "uid": uid})
-
-                    header = response_part[0].decode() if isinstance(response_part[0], bytes) else ""
-                    internaldate = ""
-                    if "INTERNALDATE" in header:
-                        start = header.find('INTERNALDATE "') + 14
-                        end = header.find('"', start)
-                        internaldate = header[start:end]
 
                     # Ensure the .eml is on disk regardless of whether we already index this hash:
                     #   - new message:                    write
@@ -703,14 +816,12 @@ def _fetch_all_emails(account: MailConnectionInfos, store: Store, ctx: Context):
                         if folder not in live:
                             # New folder for this message OR resurrection of a previously-removed one.
                             existing.setdefault("history", []).append({"folder": folder, "uid": uid})
-                            store.save()
                         else:
                             # Folder is currently live. UID may have changed (UIDVALIDITY bump on
                             # a message that stayed in the folder); update it in place.
                             h = live[folder]
                             if h.get("uid") != uid:
                                 h["uid"] = uid
-                                store.save()
                     else:
                         email_data = message_from_bytes(raw_email)
                         store.messages[content_hash] = {
@@ -721,13 +832,15 @@ def _fetch_all_emails(account: MailConnectionInfos, store: Store, ctx: Context):
                             "internaldate": internaldate,
                             "history": [{"folder": folder, "uid": uid}],
                         }
-                        store.save()
                         new_count += 1
                         subject_preview = safe_str(
                             decoded_header(email_data, "Subject", "(no subject)")[:50], allow_newlines=False
                         )
                         ctx.log(f"Fetched: {subject_preview}", Verbosity.DEBUG)
-                print(f"\r    {i}/{len(uids)}", end="", flush=True)
+                    done += 1
+                    print(f"\r    {done}/{len(uids)}", end="", flush=True)
+                # Save once per batch — atomic; orphan adoption recovers a crash mid-batch.
+                store.save()
             if uids:
                 print()
 

@@ -228,6 +228,106 @@ class TestSafeStr(unittest.TestCase):
         self.assertEqual(safe_str(42), "42")
 
 
+class TestParseSizeResponse(unittest.TestCase):
+    def test_basic(self):
+        data = [
+            b"1 (UID 5 RFC822.SIZE 1234)",
+            b"2 (UID 6 RFC822.SIZE 5678)",
+        ]
+        sizes, errors = sm.parse_size_response(data)
+        self.assertEqual(sizes, {5: 1234, 6: 5678})
+        self.assertEqual(errors, [])
+
+    def test_reports_lines_without_uid_or_size(self):
+        data = [
+            b"1 (UID 5 RFC822.SIZE 100)",
+            b"2 (RFC822.SIZE 999)",  # no UID
+            b"3 (UID 7)",  # no size
+            b"junk",
+        ]
+        sizes, errors = sm.parse_size_response(data)
+        self.assertEqual(sizes, {5: 100})
+        self.assertEqual(len(errors), 3)  # one per malformed line
+
+    def test_reports_non_bytes_entries(self):
+        sizes, errors = sm.parse_size_response([None, b"1 (UID 5 RFC822.SIZE 100)"])
+        self.assertEqual(sizes, {5: 100})
+        self.assertEqual(len(errors), 1)
+        self.assertIn("non-bytes", errors[0])
+
+
+class TestPackFetchBatches(unittest.TestCase):
+    def _pack(self, uids, sizes, max_count, max_bytes):
+        return list(sm.pack_fetch_batches(uids, sizes, max_count, max_bytes))
+
+    def test_count_cap_only(self):
+        # No size info; falls through to count-only packing.
+        self.assertEqual(self._pack([1, 2, 3, 4, 5], {}, max_count=2, max_bytes=999), [[1, 2], [3, 4], [5]])
+
+    def test_byte_cap_splits(self):
+        sizes = {1: 30, 2: 30, 3: 30}  # any pair fits, all three don't
+        self.assertEqual(self._pack([1, 2, 3], sizes, max_count=10, max_bytes=70), [[1, 2], [3]])
+
+    def test_single_oversized_message_goes_alone(self):
+        # A single message bigger than max_bytes still gets fetched — alone in its own batch.
+        sizes = {1: 5, 2: 100, 3: 5}
+        self.assertEqual(self._pack([1, 2, 3], sizes, max_count=10, max_bytes=50), [[1], [2], [3]])
+
+    def test_empty_input(self):
+        self.assertEqual(self._pack([], {}, 50, 100), [])
+
+
+class TestParseFetchResponse(unittest.TestCase):
+    def test_single_message(self):
+        data = [
+            (b'1 (UID 5 INTERNALDATE "01-Jan-2026 12:00:00 +0000" RFC822 {12}', b"hello world\n"),
+            b")",
+        ]
+        results, errors = sm.parse_fetch_response(data)
+        self.assertEqual(results, [(5, b"hello world\n", "01-Jan-2026 12:00:00 +0000")])
+        self.assertEqual(errors, [])
+
+    def test_multiple_messages(self):
+        data = [
+            (b'1 (UID 5 INTERNALDATE "01-Jan-2026 12:00:00 +0000" RFC822 {12}', b"hello world\n"),
+            b")",
+            (b'2 (UID 6 INTERNALDATE "02-Feb-2026 13:00:00 +0000" RFC822 {7}', b"second\n"),
+            b")",
+        ]
+        results, errors = sm.parse_fetch_response(data)
+        self.assertEqual(
+            results,
+            [
+                (5, b"hello world\n", "01-Jan-2026 12:00:00 +0000"),
+                (6, b"second\n", "02-Feb-2026 13:00:00 +0000"),
+            ],
+        )
+        self.assertEqual(errors, [])
+
+    def test_missing_internaldate_yields_empty_string(self):
+        data = [(b"1 (UID 5 RFC822 {3}", b"foo"), b")"]
+        results, errors = sm.parse_fetch_response(data)
+        self.assertEqual(results, [(5, b"foo", "")])
+        self.assertEqual(errors, [])
+
+    def test_tuple_without_uid_is_reported(self):
+        data = [
+            (b"1 (RFC822 {3}", b"bar"),  # no UID — recorded as error, not silent skip
+            (b"2 (UID 7 RFC822 {3}", b"baz"),
+            b")",
+        ]
+        results, errors = sm.parse_fetch_response(data)
+        self.assertEqual(results, [(7, b"baz", "")])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("missing UID", errors[0])
+
+    def test_closing_paren_separator_is_not_an_error(self):
+        # The trailing b")" between per-message tuples is normal response shape.
+        data = [(b"1 (UID 5 RFC822 {3}", b"foo"), b")"]
+        _results, errors = sm.parse_fetch_response(data)
+        self.assertEqual(errors, [])
+
+
 class TestMailConnectionInfos(unittest.TestCase):
     def test_from_dict_valid(self):
         info = MailConnectionInfos.from_dict({"name": "work", "username": "u"})
@@ -1254,26 +1354,53 @@ class _FakeIMAPServer:
                                 except (OSError, ssl.SSLError):
                                     pass
                                 return
-                            # sub_rest looks like: "<uid> (RFC822 INTERNALDATE)"
+                            # sub_rest looks like: "<uid_set> (RFC822 INTERNALDATE)"
+                            # uid_set is one of: "5", "1,3,5", "1:5", "1:*", "1:3,7,9"
                             try:
-                                uid_str, _spec = sub_rest.split(" ", 1)
-                                uid = int(uid_str)
-                            except (ValueError, IndexError):
+                                uid_set_str, _spec = sub_rest.split(" ", 1)
+                            except ValueError:
                                 self._wln(f"{tag} BAD malformed fetch")
                                 continue
-                            msg = next((m for m in self.selected.messages if m.uid == uid), None)
-                            if msg is None:
-                                self._wln(f"{tag} OK FETCH completed")
+                            all_uids = [m.uid for m in self.selected.messages]
+                            requested = []
+                            try:
+                                for piece in uid_set_str.split(","):
+                                    if ":" in piece:
+                                        lo_str, hi_str = piece.split(":", 1)
+                                        lo_v = int(lo_str)
+                                        hi_v = (max(all_uids) if all_uids else 0) if hi_str == "*" else int(hi_str)
+                                        for v in all_uids:
+                                            if lo_v <= v <= hi_v:
+                                                requested.append(v)
+                                    else:
+                                        v = int(piece)
+                                        if v in all_uids:
+                                            requested.append(v)
+                            except ValueError:
+                                self._wln(f"{tag} BAD malformed fetch UID set")
                                 continue
-                            seq = self.selected.messages.index(msg) + 1
-                            header = (
-                                f"* {seq} FETCH (UID {msg.uid} "
-                                f'INTERNALDATE "{msg.internaldate}" '
-                                f"RFC822 {{{len(msg.body)}}}\r\n"
-                            ).encode("ascii")
-                            self._wraw(header)
-                            self._wraw(msg.body)
-                            self._wraw(b")\r\n")
+                            if "RFC822.SIZE" in _spec:
+                                # Size pre-flight: no literal body, just the size attribute.
+                                for uid in requested:
+                                    msg = next((m for m in self.selected.messages if m.uid == uid), None)
+                                    if msg is None:
+                                        continue
+                                    seq = self.selected.messages.index(msg) + 1
+                                    self._wln(f"* {seq} FETCH (UID {msg.uid} RFC822.SIZE {len(msg.body)})")
+                            else:
+                                for uid in requested:
+                                    msg = next((m for m in self.selected.messages if m.uid == uid), None)
+                                    if msg is None:
+                                        continue
+                                    seq = self.selected.messages.index(msg) + 1
+                                    header = (
+                                        f"* {seq} FETCH (UID {msg.uid} "
+                                        f'INTERNALDATE "{msg.internaldate}" '
+                                        f"RFC822 {{{len(msg.body)}}}\r\n"
+                                    ).encode("ascii")
+                                    self._wraw(header)
+                                    self._wraw(msg.body)
+                                    self._wraw(b")\r\n")
                             self._wln(f"{tag} OK FETCH completed")
                         else:
                             self._wln(f"{tag} BAD unknown UID command: {sub}")
@@ -1373,6 +1500,38 @@ class TestSyncIntegration(unittest.TestCase):
             # UIDVALIDITY recorded
             self.assertEqual(store.folder_states["INBOX"]["uidvalidity"], 42)
         self.assertEqual(ctx.errors, [])
+
+    def test_byte_cap_splits_batches(self):
+        # With SYNC_BATCH_BYTES smaller than two messages combined, packer must split.
+        # End-to-end: server still returns all messages; client must consume them across batches.
+        inbox = self.imap.add_folder("INBOX")
+        for i in range(4):
+            inbox.add(_make_eml(f"msg-{i}", body_text="x" * 200))  # each ~300+ bytes
+        ctx = Context()
+        with patch.object(sm, "SYNC_BATCH_BYTES", 400):  # forces ~one message per batch
+            sm.sync_emails(self._account(), ctx, auto_apply=True)
+        eml_files = list((self.tmppath / "store" / "mails").glob("*.eml"))
+        self.assertEqual(len(eml_files), 4)
+        with Store(self.tmppath / "store") as store:
+            self.assertEqual(len(store.messages), 4)
+
+    def test_batched_fetch_handles_more_than_one_batch(self):
+        # Add more messages than SYNC_BATCH_SIZE so the fetch loop runs at least
+        # twice and the fake server has to satisfy a multi-UID FETCH range.
+        inbox = self.imap.add_folder("INBOX")
+        n = sm.SYNC_BATCH_SIZE + 5
+        for i in range(n):
+            inbox.add(_make_eml(f"msg-{i:03d}"))
+
+        ctx = Context()
+        sm.sync_emails(self._account(), ctx, auto_apply=True)
+
+        eml_files = list((self.tmppath / "store" / "mails").glob("*.eml"))
+        self.assertEqual(len(eml_files), n)
+        with Store(self.tmppath / "store") as store:
+            self.assertEqual(len(store.messages), n)
+            subjects = sorted(e["subject"] for e in store.messages.values())
+            self.assertEqual(subjects, [f"msg-{i:03d}" for i in range(n)])
 
     def test_sync_handles_non_ascii_header(self):
         # Non-conforming senders put raw 8-bit bytes (typically UTF-8) directly
@@ -1515,8 +1674,11 @@ class TestSyncIntegration(unittest.TestCase):
         inbox.fetch_failures_remaining = 99  # always fail
 
         ctx = Context()
-        with self.assertRaises(SMException):
-            sm.sync_emails(self._account(), ctx, auto_apply=True, max_silent_retries=0)
+        # max_silent_retries=0 still triggers the "Retry? [y/N]" prompt; mock input so
+        # the test doesn't block on stdin when run interactively (e.g. `make verify`).
+        with patch("builtins.input", return_value="n"):
+            with self.assertRaises(SMException):
+                sm.sync_emails(self._account(), ctx, auto_apply=True, max_silent_retries=0)
 
     def test_midsync_partial_state_is_consistent(self):
         # First two FETCHes succeed (1 message), then connection drops mid-fetch on the 3rd.
@@ -1537,8 +1699,9 @@ class TestSyncIntegration(unittest.TestCase):
 
         inbox.fetch_failures_remaining = 99
         ctx = Context()
-        with self.assertRaises(SMException):
-            sm.sync_emails(self._account(), ctx, auto_apply=True, max_silent_retries=0)
+        with patch("builtins.input", return_value="n"):
+            with self.assertRaises(SMException):
+                sm.sync_emails(self._account(), ctx, auto_apply=True, max_silent_retries=0)
 
         # Whatever is on disk must be valid JSON with the expected shape (atomic write invariant).
         store_path = self.tmppath / "store"
