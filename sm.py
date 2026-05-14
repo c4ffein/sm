@@ -108,6 +108,10 @@ class ReadUIState:
     # has been deleted since last save. Treated as a one-off [custom] in that case so
     # the user doesn't lose their filter to a config drift.
     last_resolved: set | None = None
+    # Diagnostic toggle for the list's date column. False = server INTERNALDATE (the
+    # sort key — matches the visible order); True = the Date: header (sender-supplied,
+    # often wrong). `d` toggles. Per-session; not persisted.
+    header_date: bool = False
 
 
 @dataclass
@@ -1872,11 +1876,12 @@ def _render_read_ui(fb, account, ctx, state, entries, start, end):
     fb.put(1, 0, header)
     fb.put(2, 0, rule)
     list_rows = max(0, H - 5)
+    date_field = "date" if state.header_date else "internaldate"
     if entries:
         for i, (_content_hash, entry) in enumerate(entries[start:end]):
             num = start + i + 1
             frm = safe_str(entry.get("from", "")[:30], allow_newlines=False)
-            date = format_date(entry.get("date", ""))
+            date = format_date(entry.get(date_field, ""))
             subj = safe_str(entry.get("subject", "(no subject)"), allow_newlines=False)
             marker = "▸ " if (start + i) == state.cursor else "  "
             prefix = f"{marker}{num:>4}  {frm:<30}  {date:<24}  "
@@ -1897,7 +1902,10 @@ def _render_read_ui(fb, account, ctx, state, entries, start, end):
     if state.find_mode:
         bottom = f"  find: {state.find_query}_   (Enter:apply  Esc:cancel  Backspace:delete)"
     else:
-        bottom = "  i/k:line  I/K:±10  j/l:edge  J/L:top/bot  Enter:open  #:jump  f:find  m:folders"
+        date_tag = "hdr" if state.header_date else "srv"
+        bottom = (
+            f"  i/k:line  I/K:±10  j/l:edge  J/L:top/bot  Enter:open  #:jump  f:find  m:folders  d:date({date_tag})"
+        )
         if ctx.errors:
             bottom += f"  e:errors({len(ctx.errors)})"
         bottom += "  q:quit"
@@ -1974,6 +1982,8 @@ def _run_read_loop(account, snapshot, ctx, state, all_entries):
                 _folder_menu_ui(state, all_entries, account, ctx)
                 state.cursor = 0
                 state.offset = 0
+            elif key == "d":
+                state.header_date = not state.header_date
             continue
 
         if key in ("q", "\x03"):
@@ -2035,6 +2045,9 @@ def _run_read_loop(account, snapshot, ctx, state, all_entries):
             _folder_menu_ui(state, all_entries, account, ctx)
             state.cursor = 0
             state.offset = 0
+            state.digit_buffer = ""
+        elif key == "d":
+            state.header_date = not state.header_date
             state.digit_buffer = ""
         elif key in ("\n", "\r"):
             if state.digit_buffer:
