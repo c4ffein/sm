@@ -81,14 +81,17 @@ class ReadUIState:
     """Session state for the read UI. Lives inside `_read_emails_ui`; not persisted.
     `offset` is the top visible row — viewport follows the cursor minimally (only scrolls
     when the cursor would go off-screen). `page_size` is recomputed from terminal height
-    each frame. `enabled_folders` empty = "all live folders" (default). `read_overrides`
-    is reserved for the local read/unread feature (pass 4)."""
+    each frame. `find_mode` is the editing sub-state: when True, keystrokes feed the
+    find editor and the bottom row shows the live prompt. `enabled_folders` empty =
+    "all live folders" (default). `read_overrides` is reserved for the local read/unread
+    feature (pass 4)."""
 
     cursor: int = 0
     offset: int = 0
     page_size: int = 20
     digit_buffer: str = ""
     find_query: str = ""
+    find_mode: bool = False
     enabled_folders: set = field(default_factory=set)
     read_overrides: dict = field(default_factory=dict)
 
@@ -914,6 +917,21 @@ def is_live(entry):
     return any(not h.get("removed") for h in entry.get("history", []))
 
 
+def _entries_visible(all_entries, state):
+    """Apply session UI filters (find query, enabled folders) to the already-live entries list.
+    Composes both filters with AND. Pass 5 adds the folder branch; pass 3 ships only find."""
+    q = state.find_query.lower() if state.find_query else ""
+    out = []
+    for h, e in all_entries:
+        if q:
+            subj = (e.get("subject") or "").lower()
+            frm = (e.get("from") or "").lower()
+            if q not in subj and q not in frm:
+                continue
+        out.append((h, e))
+    return out
+
+
 def is_gone(entry):
     """True iff the message has no live folder location anywhere we've synced.
     Equivalent to `not is_live(entry)`. See `_sync_apply` for the eventual-consistency contract:
@@ -1327,27 +1345,20 @@ def _run_read_loop(account, snapshot, ctx, state, all_entries):
         # page nav (below) uses the current page_size.
         state.page_size = max(1, term_height - 5)
 
-        entries = all_entries  # passes 3+5 will filter here
+        entries = _entries_visible(all_entries, state)
 
-        if not entries:
-            print(f"{_HOME}  {account.name} — no matches.  [q]uit{_EOL}{_EOS}", end="", flush=True)
-            key = _read_key()
-            if key in ("q", "\x03"):
-                return
-            continue
-
-        if state.cursor < 0:
+        # Cursor/offset clamping. Empty list is a normal render with a hint, not a special
+        # screen — keeps the user's context (header, chrome, bottom row) intact.
+        if entries:
+            state.cursor = max(0, min(state.cursor, len(entries) - 1))
+            if state.cursor < state.offset:
+                state.offset = state.cursor
+            elif state.cursor >= state.offset + state.page_size:
+                state.offset = state.cursor - state.page_size + 1
+            state.offset = max(0, min(state.offset, max(0, len(entries) - state.page_size)))
+        else:
             state.cursor = 0
-        if state.cursor >= len(entries):
-            state.cursor = len(entries) - 1
-
-        # Viewport follows cursor: only scroll the visible window when the cursor would go
-        # off-screen. Lets the user move one line at the bottom without flipping a whole page.
-        if state.cursor < state.offset:
-            state.offset = state.cursor
-        elif state.cursor >= state.offset + state.page_size:
-            state.offset = state.cursor - state.page_size + 1
-        state.offset = max(0, min(state.offset, max(0, len(entries) - state.page_size)))
+            state.offset = 0
         start = state.offset
         end = min(start + state.page_size, len(entries))
 
@@ -1358,39 +1369,95 @@ def _run_read_loop(account, snapshot, ctx, state, all_entries):
         buf = [_HOME]
         rule = f"{'─' * term_width}{_EOL}\n"
         buf.append(rule)
-        buf.append(
-            f"  {account.name} — entry {state.cursor + 1}/{len(entries)} "
-            f"(showing {start + 1}–{end} of {len(entries)}){_EOL}\n"
-        )
+        if entries:
+            header = (
+                f"  {account.name} — entry {state.cursor + 1}/{len(entries)} "
+                f"(showing {start + 1}–{end} of {len(entries)})"
+            )
+        else:
+            header = f"  {account.name} — 0 entries"
+        # Stale "find: query" indicator shown only when filter is committed (find_mode off).
+        # During editing, the live prompt at the bottom is the single source of truth.
+        if state.find_query and not state.find_mode:
+            header += f"   find: {state.find_query}"
+        buf.append(f"{header}{_EOL}\n")
         buf.append(rule)
-        for i, (_content_hash, entry) in enumerate(entries[start:end]):
-            num = start + i + 1
-            frm = safe_str(entry.get("from", "")[:30], allow_newlines=False)
-            date = format_date(entry.get("date", ""))
-            subj = safe_str(entry.get("subject", "(no subject)"), allow_newlines=False)
-            marker = "▸ " if (start + i) == state.cursor else "  "
-            prefix = f"{marker}{num:>4}  {frm:<30}  {date:<24}  "
-            max_subj = term_width - len(prefix) - 1
-            if max_subj > 0 and len(subj) > max_subj:
-                subj = subj[: max_subj - 1] + "…"
-            buf.append(f"{prefix}{subj}{_EOL}\n")
+        if entries:
+            for i, (_content_hash, entry) in enumerate(entries[start:end]):
+                num = start + i + 1
+                frm = safe_str(entry.get("from", "")[:30], allow_newlines=False)
+                date = format_date(entry.get("date", ""))
+                subj = safe_str(entry.get("subject", "(no subject)"), allow_newlines=False)
+                marker = "▸ " if (start + i) == state.cursor else "  "
+                prefix = f"{marker}{num:>4}  {frm:<30}  {date:<24}  "
+                max_subj = term_width - len(prefix) - 1
+                if max_subj > 0 and len(subj) > max_subj:
+                    subj = subj[: max_subj - 1] + "…"
+                buf.append(f"{prefix}{subj}{_EOL}\n")
+            rendered = end - start
+        else:
+            # Empty list: center a hint mid-body, leave the rest blank.
+            hint = "no email with the current filters" if (state.find_query or state.enabled_folders) else "no email"
+            mid = state.page_size // 2
+            for r in range(state.page_size):
+                if r == mid:
+                    pad = max(0, (term_width - len(hint)) // 2)
+                    buf.append(f"{' ' * pad}{hint}{_EOL}\n")
+                else:
+                    buf.append(f"{_EOL}\n")
+            rendered = state.page_size
         # Pad blank rows so the bottom chrome stays pinned to the terminal bottom.
         # _EOL on each pad wipes any leftover content from the previous frame on that row.
-        for _ in range(state.page_size - (end - start)):
+        for _ in range(state.page_size - rendered):
             buf.append(f"{_EOL}\n")
         buf.append(rule)
-        actions = "  i/k:line  I/K:±10  j/l:edge  J/L:top/bot  Enter:open  #:jump"
-        if ctx.errors:
-            actions += f"  e:errors({len(ctx.errors)})"
-        actions += "  q:quit"
-        if state.digit_buffer:
-            actions += f"   buffer: {state.digit_buffer}"
+        if state.find_mode:
+            # `_` is a visible caret since the terminal cursor is hidden. Live filter
+            # applies to entries[] on next iteration when find_query changes.
+            bottom = f"  find: {state.find_query}_   (Enter:apply  Esc:cancel  Backspace:delete)"
+        else:
+            bottom = "  i/k:line  I/K:±10  j/l:edge  J/L:top/bot  Enter:open  #:jump  f:find"
+            if ctx.errors:
+                bottom += f"  e:errors({len(ctx.errors)})"
+            bottom += "  q:quit"
+            if state.digit_buffer:
+                bottom += f"   buffer: {state.digit_buffer}"
         # No trailing newline on the last line: leaves cursor on the bottom row instead of
         # scrolling. _EOS wipes anything below in case a previous frame was taller.
-        buf.append(f"{actions}{_EOL}{_EOS}")
+        buf.append(f"{bottom}{_EOL}{_EOS}")
         print("".join(buf), end="", flush=True)
 
         key = _read_key()
+
+        # While editing the find query, keystrokes feed the editor instead of the nav
+        # dispatch. The list above re-filters every frame as find_query changes —
+        # substring match is cheap enough for live updates even on large mailboxes.
+        if state.find_mode:
+            if key in ("\n", "\r"):
+                state.find_mode = False
+                state.cursor = 0
+                state.offset = 0
+            elif key in ("\x1b", "\x03"):
+                state.find_mode = False
+                state.find_query = ""
+                state.cursor = 0
+                state.offset = 0
+            elif key in ("\x7f", "\x08"):  # DEL or BS — terminal varies
+                state.find_query = state.find_query[:-1]
+            elif key and key.isprintable():
+                state.find_query += key
+            # else: ignore unhandled control chars (arrow keys, tab, etc.)
+            continue
+
+        # If the list is empty (find/folder filter matched nothing), navigation keys are
+        # meaningless. Only quit and find-mode entry stay live.
+        if not entries:
+            if key in ("q", "\x03"):
+                return
+            if key == "f":
+                state.find_mode = True
+            continue
+
         if key in ("q", "\x03"):
             return
         elif key == "i":
@@ -1434,6 +1501,17 @@ def _run_read_loop(account, snapshot, ctx, state, all_entries):
         elif key.isdigit():
             state.digit_buffer += key
         elif key == "\x1b":
+            # Layered Esc: clear a pending digit buffer first, otherwise clear an active find.
+            # Folder filter (pass 5) is not cleared on Esc — that's a deliberate setup, not a
+            # quick toggle.
+            if state.digit_buffer:
+                state.digit_buffer = ""
+            elif state.find_query:
+                state.find_query = ""
+                state.cursor = 0
+                state.offset = 0
+        elif key == "f":
+            state.find_mode = True
             state.digit_buffer = ""
         elif key in ("\n", "\r"):
             if state.digit_buffer:

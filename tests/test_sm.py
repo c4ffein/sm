@@ -2281,6 +2281,52 @@ class TestReadUIViewport(unittest.TestCase):
         out = self._run(["l", "l", "\n", "q"])
         self.assertIn("Subject: email 30", out)
 
+    def test_find_filters_to_matching_subject_and_opens_it(self):
+        # f enters find_mode; each character is a keystroke; Enter applies; Enter opens
+        # the single match (entries[0] after filter = "email 15").
+        keys = ["f", *list("email 15"), "\n", "\n", "q"]
+        out = self._run(keys)
+        self.assertIn("Subject: email 15", out)
+
+    def test_find_empty_query_applies_no_filter(self):
+        # f → immediate Enter exits with empty query → q quits without opening anything.
+        out = self._run(["f", "\n", "q"])
+        self.assertNotIn("Subject: email", out)
+        self.assertIn("/30", out)
+
+    def test_find_no_matches_renders_inline_hint(self):
+        # No more separate screen; the list area shows "no email with the current filters".
+        keys = ["f", *list("zzznope"), "\n", "q"]
+        out = self._run(keys)
+        self.assertIn("no email with the current filters", out)
+
+    def test_find_is_case_insensitive_and_matches_from(self):
+        # 'S@EXAMPLE' matches every entry's from (s@example.com); first match is "email 01".
+        keys = ["f", *list("S@EXAMPLE"), "\n", "\n", "q"]
+        out = self._run(keys)
+        self.assertIn("Subject: email 01", out)
+
+    def test_esc_in_find_mode_cancels_and_clears_query(self):
+        # f → type 'nope' → Esc cancels (query cleared, find_mode exited) → q quits.
+        # The unfiltered list (entry x/30) is rendered between Esc and q.
+        keys = ["f", *list("nope"), "\x1b", "q"]
+        out = self._run(keys)
+        self.assertIn("/30", out)
+
+    def test_backspace_in_find_mode_removes_last_char(self):
+        # Type 'email 159' then DEL → query = 'email 15' → Enter applies → Enter opens.
+        keys = ["f", *list("email 159"), "\x7f", "\n", "\n", "q"]
+        out = self._run(keys)
+        self.assertIn("Subject: email 15", out)
+
+    def test_find_query_live_updates_during_typing(self):
+        # Verify the prompt re-renders each keystroke by checking that an intermediate
+        # query state ('em') and the final state ('email 15') both appear in stdout.
+        keys = ["f", *list("email 15"), "\n", "q"]
+        out = self._run(keys)
+        self.assertIn("find: em", out)
+        self.assertIn("find: email 15", out)
+
 
 class TestReadUIErrorRecording(unittest.TestCase):
     """End-to-end coverage of the read UI's error-handling story: each recoverable failure
