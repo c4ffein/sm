@@ -50,6 +50,7 @@ from sys import flags as sys_flags
 from sys import stdin as sys_stdin
 from termios import TCSADRAIN, tcgetattr, tcsetattr
 from tty import setraw
+from unicodedata import east_asian_width
 from urllib.error import HTTPError
 
 CONFIG_PATH = Path.home() / ".config" / "sm" / "config.json"
@@ -1452,15 +1453,200 @@ def _show_errors_screen(ctx, term_width):
 
 
 _CLEAR_SCREEN = "\x1b[H\x1b[2J"  # used only on UI exit, to hand back a clean canvas
-_HOME = "\x1b[H"  # cursor to (1,1) without clearing — per-frame, no flicker
-_EOL = "\x1b[K"  # erase from cursor to end of line — wipe leftover trailing chars
-_EOS = "\x1b[J"  # erase from cursor to end of screen — wipe rows below shorter frames
 _HIDE_CURSOR = "\x1b[?25l"
 _SHOW_CURSOR = "\x1b[?25h"
 
 
-def _folder_menu_ui(state, all_entries, account):
+def _cell_width(ch):
+    """Display width of one char: 0 for empty (wide-char continuation), 2 for East-Asian
+    Wide/Fullwidth, 1 otherwise. Caller must pre-sanitize control chars (use safe_str)."""
+    if ch == "":
+        return 0
+    return 2 if east_asian_width(ch) in ("W", "F") else 1
+
+
+class _Cell:
+    __slots__ = ("ch", "color")
+
+    def __init__(self, ch=" ", color=None):
+        self.ch = ch
+        self.color = color or Color.WHITE
+
+
+class FB:
+    """Cell-grid framebuffer. Per-cell (char, Color). Wide chars take 2 cells; the
+    trailing cell holds ch="" as a continuation marker. Inputs must be plain text +
+    a Color — never strings with embedded ANSI escapes; the flush owns color emission.
+    The flush emits a full-grid paint on each call: no diffing, no leftover state."""
+
+    def __init__(self, w, h):
+        self.w = w
+        self.h = h
+        self.cells = [[_Cell() for _ in range(w)] for _ in range(h)]
+
+    def put(self, row, col, text, color=None):
+        """Write `text` at (row, col). Wide chars take 2 cells. Clips to bounds.
+        A wide char that won't fit at the right edge is dropped, not half-rendered."""
+        if row < 0 or row >= self.h or col >= self.w:
+            return
+        c = col
+        for ch in text:
+            if c >= self.w:
+                break
+            w = _cell_width(ch)
+            if w == 0:  # caller passed a continuation marker; ignore
+                continue
+            if c < 0:
+                c += w
+                continue
+            if w == 2:
+                if c + 1 >= self.w:
+                    break
+                self.cells[row][c] = _Cell(ch, color)
+                self.cells[row][c + 1] = _Cell("", color)
+                c += 2
+            else:
+                self.cells[row][c] = _Cell(ch, color)
+                c += 1
+
+    def fill_rect(self, row, col, w, h, ch=" ", color=None):
+        for r in range(max(0, row), min(self.h, row + h)):
+            for cc in range(max(0, col), min(self.w, col + w)):
+                self.cells[r][cc] = _Cell(ch, color)
+
+    def dim_rect(self, row, col, w, h):
+        """Replace the fg color of every cell in the rect with DIM, preserving chars.
+        Used to grey out the base layer before drawing a modal on top."""
+        for r in range(max(0, row), min(self.h, row + h)):
+            for cc in range(max(0, col), min(self.w, col + w)):
+                self.cells[r][cc].color = Color.DIM
+
+    def region(self, row, col, w, h):
+        """Sub-FB view: writes translate to parent coords + clip to the box. Use for
+        modal contents so the renderer can think in box-local (0,0)..(w,h) coords."""
+        return _Region(self, row, col, w, h)
+
+    def serialize(self):
+        """Return a single string with cursor positioning + colored chars for the whole
+        grid. Caller writes it to stdout in one flush. Trailing reset leaves the terminal
+        in a known color so any later writes don't inherit the last cell's color."""
+        parts = ["\x1b[H"]
+        cur_color = None
+        for r in range(self.h):
+            parts.append(f"\x1b[{r + 1};1H")
+            cc = 0
+            while cc < self.w:
+                cell = self.cells[r][cc]
+                if cell.ch == "":  # wide-char continuation
+                    cc += 1
+                    continue
+                if cell.color is not cur_color:
+                    parts.append(cell.color.value)
+                    cur_color = cell.color
+                parts.append(cell.ch)
+                cc += _cell_width(cell.ch)
+        if cur_color is not Color.WHITE:
+            parts.append(Color.WHITE.value)
+        return "".join(parts)
+
+
+class _Region:
+    """Bounded sub-FB. put/fill_rect coords are box-local; the region truncates text
+    that would overflow its right edge so the modal can't bleed into the dimmed base."""
+
+    def __init__(self, parent, row, col, w, h):
+        self.parent = parent
+        self.row0 = row
+        self.col0 = col
+        self.w = w
+        self.h = h
+
+    def put(self, row, col, text, color=None):
+        if row < 0 or row >= self.h or col >= self.w:
+            return
+        if col < 0:
+            col = 0
+        available = self.w - col
+        clipped = []
+        used = 0
+        for ch in text:
+            cw = _cell_width(ch)
+            if cw == 0:
+                continue
+            if used + cw > available:
+                break
+            clipped.append(ch)
+            used += cw
+        self.parent.put(self.row0 + row, self.col0 + col, "".join(clipped), color)
+
+    def fill_rect(self, row, col, w, h, ch=" ", color=None):
+        r0 = max(0, row)
+        c0 = max(0, col)
+        r1 = min(self.h, row + h)
+        c1 = min(self.w, col + w)
+        if r1 <= r0 or c1 <= c0:
+            return
+        self.parent.fill_rect(self.row0 + r0, self.col0 + c0, c1 - c0, r1 - r0, ch, color)
+
+
+def _draw_modal_frame(fb, row, col, w, h):
+    """Draw a single-line box frame at (row,col) with size (w,h) and clear its interior.
+    Box-drawing chars are width-1, so cell math is straightforward."""
+    if w < 2 or h < 2:
+        return
+    fb.put(row, col, "┌" + "─" * (w - 2) + "┐")
+    fb.put(row + h - 1, col, "└" + "─" * (w - 2) + "┘")
+    for r in range(row + 1, row + h - 1):
+        fb.put(r, col, "│")
+        fb.put(r, col + w - 1, "│")
+    fb.fill_rect(row + 1, col + 1, w - 2, h - 2, ch=" ")
+
+
+def _render_folder_menu(
+    region,
+    working_selection,
+    working_set,
+    filter_off,
+    all_folders,
+    preset_labels,
+    folder_cursor,
+    folder_offset,
+    page_size,
+):
+    """Paint the folder menu into `region` (a sub-FB the size of the modal interior).
+    Layout (region-local rows): 0 header, 1 presets, 2 separator, 3..h-2 folder list,
+    h-1 bottom legend."""
+    W, H = region.w, region.h
+    count_label = "all" if filter_off else str(len(working_set))
+    region.put(0, 0, f"  Folder filter — {count_label}/{len(all_folders)}   active: {working_selection}")
+    # Presets line: emit each label as its own put() so the active one can be colored.
+    region.put(1, 0, "  Presets:  ")
+    col = len("  Presets:  ")
+    for label in preset_labels:
+        color = Color.PURP if label == working_selection else Color.WHITE
+        region.put(1, col, label, color=color)
+        col += len(label) + 2
+    region.put(2, 0, "─" * W)
+    end = min(folder_offset + page_size, len(all_folders))
+    for i, name in enumerate(all_folders[folder_offset:end]):
+        idx = folder_offset + i
+        marker = "▸ " if idx == folder_cursor else "  "
+        ticked = filter_off or (name in working_set)
+        box = "[X]" if ticked else "[ ]"
+        region.put(3 + i, 0, f"{marker}{box} {safe_str(name, allow_newlines=False)}")
+    region.put(H - 1, 0, "  i/k:folder  j/l:preset(live)  space:toggle  Enter:apply  Esc:cancel")
+
+
+def _folder_menu_ui(state, all_entries, account, ctx):
     """Modal folder filter with config presets + persisted custom state.
+
+    Composes over the read UI: each tick we re-render the (committed-state) read UI
+    base into the framebuffer, dim the whole grid, draw a modal box with a 6-cell
+    margin, then paint the menu into the box's interior. On small terminals (<40w
+    or <14h) the modal falls back to full-screen so the box doesn't shrink past
+    usability. The base reflects the *committed* filter (state.selection_current);
+    only the menu's own ticks/preset-row track the working preview, so j/l doesn't
+    flicker the underlying list.
 
     Preset row layout:
       [none]   <named presets from config…>   [custom]
@@ -1468,11 +1654,10 @@ def _folder_menu_ui(state, all_entries, account):
     - [custom] = the user's last freely-edited folder set.
     - A named preset is "active" iff working_selection equals its name.
 
-    Storage model (new in Pass 6 refactor): we track *intent* — which preset is selected
-    — not the resolved folder set. Editing a folder while on a named preset rolls into
-    [custom] with the edited set. Navigating to a named preset does NOT touch custom.
-    Resolution against live config happens at read time, so preset edits in config
-    auto-apply next session.
+    Storage model: we track *intent* — which preset is selected — not the resolved
+    folder set. Editing a folder while on a named preset rolls into [custom] with the
+    edited set. Navigating to a named preset does NOT touch custom. Resolution against
+    live config happens at read time, so preset edits in config auto-apply next session.
 
     Keys: i/k move the folder cursor, j/l move the preset cursor AND apply that preset
     immediately (live preview — the folder ticks reflect the new selection right away).
@@ -1521,14 +1706,18 @@ def _folder_menu_ui(state, all_entries, account):
     folder_offset = 0
 
     while True:
-        try:
-            sz = os.get_terminal_size()
-            term_width = sz.columns
-            term_height = sz.lines
-        except (ValueError, OSError):
-            term_width, term_height = 80, 24
-        # 7 lines of chrome: 3 rules, header, preset row, padding rule, bottom.
-        page_size = max(1, term_height - 7)
+        W, H = _term_size()
+        # 6-cell margin around the modal; fall back to full-screen on small terminals.
+        if W >= 40 and H >= 14:
+            box_row, box_col = 6, 6
+            box_w, box_h = W - 12, H - 12
+        else:
+            box_row, box_col = 0, 0
+            box_w, box_h = W, H
+        inner_w = max(1, box_w - 2)
+        inner_h = max(1, box_h - 2)
+        # 4 rows of chrome inside the modal: header, presets, separator, bottom legend.
+        page_size = max(1, inner_h - 4)
 
         folder_cursor = max(0, min(folder_cursor, len(all_folders) - 1))
         if folder_cursor < folder_offset:
@@ -1536,39 +1725,48 @@ def _folder_menu_ui(state, all_entries, account):
         elif folder_cursor >= folder_offset + page_size:
             folder_offset = folder_cursor - page_size + 1
         folder_offset = max(0, min(folder_offset, max(0, len(all_folders) - page_size)))
-        start = folder_offset
-        end = min(start + page_size, len(all_folders))
 
+        # Recompute the base read-UI view from *committed* state, so the dimmed
+        # background reflects what would be there if the modal closed without commit.
+        enabled = _resolve_filter(
+            state.selection_current,
+            state.folders_selected_in_custom,
+            state.last_resolved,
+            presets,
+        )
+        base_entries = _entries_visible(all_entries, state, enabled)
+        base_state_page = max(1, H - 5)
+        if base_entries:
+            base_start = max(0, min(state.offset, max(0, len(base_entries) - base_state_page)))
+        else:
+            base_start = 0
+        base_end = min(base_start + base_state_page, len(base_entries))
+
+        fb = FB(W, H)
+        # Stash & restore page_size so the base render uses the right viewport size
+        # without the modal mutating live state.
+        saved_page_size = state.page_size
+        state.page_size = base_state_page
+        try:
+            _render_read_ui(fb, account, ctx, state, base_entries, base_start, base_end)
+        finally:
+            state.page_size = saved_page_size
+        fb.dim_rect(0, 0, W, H)
+        _draw_modal_frame(fb, box_row, box_col, box_w, box_h)
+        region = fb.region(box_row + 1, box_col + 1, inner_w, inner_h)
         working_set, filter_off = working_resolved()
-        buf = [_HOME]
-        rule = f"{'─' * term_width}{_EOL}\n"
-        buf.append(rule)
-        count_label = "all" if filter_off else str(len(working_set))
-        buf.append(f"  Folder filter — {count_label}/{len(all_folders)}   active: {working_selection}{_EOL}\n")
-        buf.append(rule)
-        # Active preset is shown by color alone. The j/l cursor is kept in sync with
-        # working_selection elsewhere (Space-on-folder updates both), so we don't need
-        # a separate marker — color = active = where j/l would navigate from.
-        preset_row = "  Presets:  "
-        for label in preset_labels:
-            chunk = label
-            if label == working_selection:
-                chunk = f"{Color.PURP.value}{chunk}{Color.WHITE.value}"
-            preset_row += chunk + "  "
-        buf.append(f"{preset_row.rstrip()}{_EOL}\n")
-        buf.append(rule)
-        for i, name in enumerate(all_folders[start:end]):
-            idx = start + i
-            marker = "▸ " if idx == folder_cursor else "  "
-            ticked = filter_off or (name in working_set)
-            box = "[X]" if ticked else "[ ]"
-            buf.append(f"{marker}{box} {safe_str(name, allow_newlines=False)}{_EOL}\n")
-        for _ in range(page_size - (end - start)):
-            buf.append(f"{_EOL}\n")
-        buf.append(rule)
-        bottom = "  i/k:folder  j/l:preset(live)  space:toggle  Enter:apply  Esc:cancel"
-        buf.append(f"{bottom}{_EOL}{_EOS}")
-        print("".join(buf), end="", flush=True)
+        _render_folder_menu(
+            region,
+            working_selection,
+            working_set,
+            filter_off,
+            all_folders,
+            preset_labels,
+            folder_cursor,
+            folder_offset,
+            page_size,
+        )
+        print(fb.serialize(), end="", flush=True)
 
         key = _read_key()
         if key in ("\n", "\r"):
@@ -1645,14 +1843,72 @@ def _read_emails_ui(account, snapshot, ctx):
         print(_SHOW_CURSOR + _CLEAR_SCREEN, end="")
 
 
+def _term_size():
+    try:
+        sz = os.get_terminal_size()
+        return sz.columns, sz.lines
+    except (ValueError, OSError):
+        return 80, 24
+
+
+def _render_read_ui(fb, account, ctx, state, entries, start, end):
+    """Paint the read UI into `fb`. Pure render: no I/O, no state mutation. Layout:
+    rows 0/2/H-2 are rules, row 1 the header, row H-1 the bottom action line, rows
+    3..H-3 the list (page_size = H - 5)."""
+    W, H = fb.w, fb.h
+    rule = "─" * W
+    fb.put(0, 0, rule)
+    if entries:
+        header = (
+            f"  {account.name} — entry {state.cursor + 1}/{len(entries)} "
+            f"(showing {start + 1}–{end} of {len(entries)})"
+        )
+    else:
+        header = f"  {account.name} — 0 entries"
+    if state.find_query and not state.find_mode:
+        header += f"   find: {state.find_query}"
+    if state.selection_current != "[none]":
+        header += f"   filter: {state.selection_current}"
+    fb.put(1, 0, header)
+    fb.put(2, 0, rule)
+    list_rows = max(0, H - 5)
+    if entries:
+        for i, (_content_hash, entry) in enumerate(entries[start:end]):
+            num = start + i + 1
+            frm = safe_str(entry.get("from", "")[:30], allow_newlines=False)
+            date = format_date(entry.get("date", ""))
+            subj = safe_str(entry.get("subject", "(no subject)"), allow_newlines=False)
+            marker = "▸ " if (start + i) == state.cursor else "  "
+            prefix = f"{marker}{num:>4}  {frm:<30}  {date:<24}  "
+            max_subj = W - len(prefix) - 1
+            if max_subj > 0 and len(subj) > max_subj:
+                subj = subj[: max_subj - 1] + "…"
+            fb.put(3 + i, 0, f"{prefix}{subj}")
+    else:
+        hint = (
+            "no email with the current filters"
+            if (state.find_query or state.selection_current != "[none]")
+            else "no email"
+        )
+        mid = list_rows // 2
+        pad = max(0, (W - len(hint)) // 2)
+        fb.put(3 + mid, pad, hint)
+    fb.put(H - 2, 0, rule)
+    if state.find_mode:
+        bottom = f"  find: {state.find_query}_   (Enter:apply  Esc:cancel  Backspace:delete)"
+    else:
+        bottom = "  i/k:line  I/K:±10  j/l:edge  J/L:top/bot  Enter:open  #:jump  f:find  m:folders"
+        if ctx.errors:
+            bottom += f"  e:errors({len(ctx.errors)})"
+        bottom += "  q:quit"
+        if state.digit_buffer:
+            bottom += f"   buffer: {state.digit_buffer}"
+    fb.put(H - 1, 0, bottom)
+
+
 def _run_read_loop(account, snapshot, ctx, state, all_entries):
     while True:
-        try:
-            sz = os.get_terminal_size()
-            term_width = sz.columns
-            term_height = sz.lines
-        except (ValueError, OSError):
-            term_width, term_height = 80, 24
+        term_width, term_height = _term_size()
         # 5 lines of chrome: top rule, header, top rule, bottom rule, actions.
         # Updated each redraw so terminal resizes apply without restart, and so j/l
         # page nav (below) uses the current page_size.
@@ -1681,76 +1937,9 @@ def _run_read_loop(account, snapshot, ctx, state, all_entries):
         start = state.offset
         end = min(start + state.page_size, len(entries))
 
-        # Build the whole frame in one buffer and write it in a single flush. Reduces
-        # SSH round-trips on rapid key repeat (one packet per frame instead of one per print).
-        # No screen-clear; each line ends with _EOL so leftover trailing chars from a longer
-        # previous frame on that row are wiped as we go.
-        buf = [_HOME]
-        rule = f"{'─' * term_width}{_EOL}\n"
-        buf.append(rule)
-        if entries:
-            header = (
-                f"  {account.name} — entry {state.cursor + 1}/{len(entries)} "
-                f"(showing {start + 1}–{end} of {len(entries)})"
-            )
-        else:
-            header = f"  {account.name} — 0 entries"
-        # Stale "find: query" indicator shown only when filter is committed (find_mode off).
-        # During editing, the live prompt at the bottom is the single source of truth.
-        if state.find_query and not state.find_mode:
-            header += f"   find: {state.find_query}"
-        if state.selection_current != "[none]":
-            header += f"   filter: {state.selection_current}"
-        buf.append(f"{header}{_EOL}\n")
-        buf.append(rule)
-        if entries:
-            for i, (_content_hash, entry) in enumerate(entries[start:end]):
-                num = start + i + 1
-                frm = safe_str(entry.get("from", "")[:30], allow_newlines=False)
-                date = format_date(entry.get("date", ""))
-                subj = safe_str(entry.get("subject", "(no subject)"), allow_newlines=False)
-                marker = "▸ " if (start + i) == state.cursor else "  "
-                prefix = f"{marker}{num:>4}  {frm:<30}  {date:<24}  "
-                max_subj = term_width - len(prefix) - 1
-                if max_subj > 0 and len(subj) > max_subj:
-                    subj = subj[: max_subj - 1] + "…"
-                buf.append(f"{prefix}{subj}{_EOL}\n")
-            rendered = end - start
-        else:
-            # Empty list: center a hint mid-body, leave the rest blank.
-            hint = (
-                "no email with the current filters"
-                if (state.find_query or state.selection_current != "[none]")
-                else "no email"
-            )
-            mid = state.page_size // 2
-            for r in range(state.page_size):
-                if r == mid:
-                    pad = max(0, (term_width - len(hint)) // 2)
-                    buf.append(f"{' ' * pad}{hint}{_EOL}\n")
-                else:
-                    buf.append(f"{_EOL}\n")
-            rendered = state.page_size
-        # Pad blank rows so the bottom chrome stays pinned to the terminal bottom.
-        # _EOL on each pad wipes any leftover content from the previous frame on that row.
-        for _ in range(state.page_size - rendered):
-            buf.append(f"{_EOL}\n")
-        buf.append(rule)
-        if state.find_mode:
-            # `_` is a visible caret since the terminal cursor is hidden. Live filter
-            # applies to entries[] on next iteration when find_query changes.
-            bottom = f"  find: {state.find_query}_   (Enter:apply  Esc:cancel  Backspace:delete)"
-        else:
-            bottom = "  i/k:line  I/K:±10  j/l:edge  J/L:top/bot  Enter:open  #:jump  f:find  m:folders"
-            if ctx.errors:
-                bottom += f"  e:errors({len(ctx.errors)})"
-            bottom += "  q:quit"
-            if state.digit_buffer:
-                bottom += f"   buffer: {state.digit_buffer}"
-        # No trailing newline on the last line: leaves cursor on the bottom row instead of
-        # scrolling. _EOS wipes anything below in case a previous frame was taller.
-        buf.append(f"{bottom}{_EOL}{_EOS}")
-        print("".join(buf), end="", flush=True)
+        fb = FB(term_width, term_height)
+        _render_read_ui(fb, account, ctx, state, entries, start, end)
+        print(fb.serialize(), end="", flush=True)
 
         key = _read_key()
 
@@ -1782,7 +1971,7 @@ def _run_read_loop(account, snapshot, ctx, state, all_entries):
             if key == "f":
                 state.find_mode = True
             elif key == "m":
-                _folder_menu_ui(state, all_entries, account)
+                _folder_menu_ui(state, all_entries, account, ctx)
                 state.cursor = 0
                 state.offset = 0
             continue
@@ -1843,7 +2032,7 @@ def _run_read_loop(account, snapshot, ctx, state, all_entries):
             state.find_mode = True
             state.digit_buffer = ""
         elif key == "m":
-            _folder_menu_ui(state, all_entries, account)
+            _folder_menu_ui(state, all_entries, account, ctx)
             state.cursor = 0
             state.offset = 0
             state.digit_buffer = ""
