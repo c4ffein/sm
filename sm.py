@@ -202,38 +202,78 @@ def pack_fetch_batches(to_fetch, sizes, max_count, max_bytes):
         yield batch
 
 
+def _extract_internaldate(s):
+    """Return the INTERNALDATE quoted value from an IMAP FETCH fragment, or '' if absent."""
+    idx = s.find('INTERNALDATE "')
+    if idx < 0:
+        return ""
+    start = idx + 14
+    end = s.find('"', start)
+    return s[start:end] if end > start else ""
+
+
 def parse_fetch_response(data):
     """Parse an imaplib FETCH response into ([(uid, raw_email, internaldate), ...], [error_details]).
 
     `data` is the second element of mail.uid("FETCH", ...) — a list with one (header_bytes, body_bytes)
-    tuple per message and trailing b')' separators. Tolerant of unexpected ordering: UID is read from
-    each tuple's header rather than inferred from request order. The trailing b')' is normal response
-    shape and silently skipped; anything else that doesn't yield a UID is reported in the errors list."""
+    tuple per message plus various non-tuple parts. Three shapes of non-tuple part are normal:
+      - b')'                         — per-message terminator when all fields fit before the literal
+      - b' INTERNALDATE "..." )'     — trailer when the server puts fields AFTER the body literal
+                                       (Gmail does this with `(RFC822 INTERNALDATE)`); patched onto
+                                       the immediately preceding result.
+      - b'<seq> (UID <n> FLAGS ...)' — untagged FETCH notification for a flag change on some other
+                                       message during our batch; no body, so no literal, so no tuple.
+                                       Ignored — we don't track flags locally.
+    Anything else that doesn't yield a UID is reported in the errors list."""
     results = []
     errors = []
     for part in data:
-        if not isinstance(part, tuple):
-            if part != b")":  # normal separator between per-message responses; not an error
-                errors.append(f"unexpected non-tuple entry: {part!r}"[:120])
+        if isinstance(part, tuple):
+            header_bytes, body = part[0], part[1]
+            if isinstance(header_bytes, bytes):
+                header = header_bytes.decode("ascii", errors="replace")
+            else:
+                header = str(header_bytes)
+            uid_match = re.search(r"\bUID (\d+)", header)
+            if not uid_match:
+                errors.append(f"tuple missing UID: {header[:80]!r}")
+                continue
+            uid = int(uid_match.group(1))
+            internaldate = _extract_internaldate(header)
+            if not internaldate and 'INTERNALDATE "' in header:
+                errors.append(f"header for UID {uid} claims INTERNALDATE but extraction failed: {header[:80]!r}")
+            results.append((uid, body, internaldate))
             continue
-        header_bytes, body = part[0], part[1]
-        if isinstance(header_bytes, bytes):
-            header = header_bytes.decode("ascii", errors="replace")
+        text = part.decode("ascii", errors="replace") if isinstance(part, bytes) else str(part)
+        stripped = text.strip()
+        if stripped == ")":
+            continue
+        # Untagged FETCH flag notification — no literal, complete in one bytes object.
+        if re.match(r"^\d+ \(UID \d+", stripped):
+            continue
+        # Trailer of the previous literal tuple: backfill INTERNALDATE if we didn't get it from the header.
+        # Gates match the field's opening delimiter (quote / paren), not just the keyword, so a custom
+        # IMAP keyword named "INTERNALDATE" or "FLAGS" can't collide with our trailer recognition.
+        if results and stripped.endswith(")") and ('INTERNALDATE "' in stripped or "FLAGS (" in stripped):
+            if 'INTERNALDATE "' in stripped:
+                internaldate = _extract_internaldate(text)
+                if internaldate:
+                    if not results[-1][2]:
+                        uid, body, _ = results[-1]
+                        results[-1] = (uid, body, internaldate)
+                    continue
+                errors.append(
+                    f"trailer for UID {results[-1][0]} claims INTERNALDATE but extraction failed: {text[:80]!r}"
+                )
+            elif "FLAGS (" in stripped:
+                continue  # FLAGS-only trailer; we don't track flags locally
         else:
-            header = str(header_bytes)
-        uid_match = re.search(r"\bUID (\d+)", header)
-        if not uid_match:
-            errors.append(f"tuple missing UID: {header[:80]!r}")
-            continue
-        uid = int(uid_match.group(1))
-        internaldate = ""
-        idx = header.find('INTERNALDATE "')
-        if idx >= 0:
-            start = idx + 14
-            end = header.find('"', start)
-            if end > start:
-                internaldate = header[start:end]
-        results.append((uid, body, internaldate))
+            errors.append(f"unexpected non-tuple entry: {part!r}"[:120])
+    # We always request INTERNALDATE alongside RFC822, so a result with no date is a parser miss
+    # (unknown trailer shape, mangled header, etc.) — surface it so silent date-loss can't recur.
+    for uid, _body, internaldate in results:
+        if not internaldate:
+            errors.append(f"missing INTERNALDATE for UID {uid}")
     return results, errors
 
 

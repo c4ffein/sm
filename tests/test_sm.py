@@ -304,27 +304,112 @@ class TestParseFetchResponse(unittest.TestCase):
         )
         self.assertEqual(errors, [])
 
-    def test_missing_internaldate_yields_empty_string(self):
+    def test_missing_internaldate_is_reported(self):
+        # We always ask for INTERNALDATE, so absence in the response is a real anomaly,
+        # not a tolerable gap. Value still returns empty string so callers don't crash.
         data = [(b"1 (UID 5 RFC822 {3}", b"foo"), b")"]
         results, errors = sm.parse_fetch_response(data)
         self.assertEqual(results, [(5, b"foo", "")])
-        self.assertEqual(errors, [])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("missing INTERNALDATE", errors[0])
+        self.assertIn("UID 5", errors[0])
 
     def test_tuple_without_uid_is_reported(self):
         data = [
             (b"1 (RFC822 {3}", b"bar"),  # no UID — recorded as error, not silent skip
-            (b"2 (UID 7 RFC822 {3}", b"baz"),
+            (b'2 (UID 7 INTERNALDATE "01-Jan-2026 12:00:00 +0000" RFC822 {3}', b"baz"),
             b")",
         ]
         results, errors = sm.parse_fetch_response(data)
-        self.assertEqual(results, [(7, b"baz", "")])
+        self.assertEqual(results, [(7, b"baz", "01-Jan-2026 12:00:00 +0000")])
         self.assertEqual(len(errors), 1)
         self.assertIn("missing UID", errors[0])
 
     def test_closing_paren_separator_is_not_an_error(self):
         # The trailing b")" between per-message tuples is normal response shape.
-        data = [(b"1 (UID 5 RFC822 {3}", b"foo"), b")"]
+        data = [(b'1 (UID 5 INTERNALDATE "01-Jan-2026 12:00:00 +0000" RFC822 {3}', b"foo"), b")"]
         _results, errors = sm.parse_fetch_response(data)
+        self.assertEqual(errors, [])
+
+    def test_internaldate_in_trailer_after_literal(self):
+        # Gmail orders `(RFC822 INTERNALDATE)` reply as RFC822 first, INTERNALDATE after.
+        # imaplib splits at the literal: trailing fields land as a non-tuple bytes entry.
+        data = [
+            (b"1 (UID 5 RFC822 {12}", b"hello world\n"),
+            b' INTERNALDATE "13-May-2026 08:04:47 +0000")',
+        ]
+        results, errors = sm.parse_fetch_response(data)
+        self.assertEqual(results, [(5, b"hello world\n", "13-May-2026 08:04:47 +0000")])
+        self.assertEqual(errors, [])
+
+    def test_trailer_with_flags_after_literal(self):
+        # Same shape as above but the server tacks FLAGS on too — still a valid trailer.
+        data = [
+            (b"1 (UID 5 RFC822 {12}", b"hello world\n"),
+            b' INTERNALDATE "14-May-2026 02:56:57 +0000" FLAGS (\\Seen))',
+        ]
+        results, errors = sm.parse_fetch_response(data)
+        self.assertEqual(results, [(5, b"hello world\n", "14-May-2026 02:56:57 +0000")])
+        self.assertEqual(errors, [])
+
+    def test_untagged_flag_notification_is_ignored(self):
+        # Server-initiated FETCH FLAGS update for an unrelated message arriving mid-batch.
+        # No literal → imaplib emits a single bytes entry. We don't track flags; skip silently.
+        data = [
+            (b'1 (UID 5 INTERNALDATE "01-Jan-2026 12:00:00 +0000" RFC822 {3}', b"foo"),
+            b")",
+            b"8017 (UID 19396 FLAGS (\\Seen))",
+        ]
+        results, errors = sm.parse_fetch_response(data)
+        self.assertEqual(results, [(5, b"foo", "01-Jan-2026 12:00:00 +0000")])
+        self.assertEqual(errors, [])
+
+    def test_unrecognized_non_tuple_still_errors(self):
+        # Anything that isn't a known shape should still surface as an error, not be swallowed.
+        data = [b"garbage bytes from a confused server"]
+        _results, errors = sm.parse_fetch_response(data)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("unexpected non-tuple entry", errors[0])
+
+    def test_trailer_claiming_internaldate_but_unparseable_surfaces_error(self):
+        # Trailer opens the INTERNALDATE quoted-string but never closes it — gate matches
+        # ('INTERNALDATE "' is present), extraction fails. Want a specific error naming the
+        # UID + the malformed bytes, plus the final-pass "missing INTERNALDATE" since UID 5
+        # never got a date from anywhere.
+        data = [
+            (b"1 (UID 5 RFC822 {3}", b"foo"),
+            b' INTERNALDATE "broken)',  # opens the quote, no closing quote before the trailer's ')'
+        ]
+        _results, errors = sm.parse_fetch_response(data)
+        self.assertTrue(
+            any("trailer for UID 5 claims INTERNALDATE but extraction failed" in e for e in errors),
+            f"expected specific trailer-extraction error, got: {errors!r}",
+        )
+        self.assertTrue(any("missing INTERNALDATE for UID 5" in e for e in errors))
+
+    def test_header_claiming_internaldate_but_unparseable_surfaces_error(self):
+        # Header opens INTERNALDATE quoted-string but never closes it — gate matches,
+        # extraction fails. Same diagnostic shape as the trailer-side equivalent.
+        data = [
+            (b'1 (UID 5 INTERNALDATE "broken RFC822 {3}', b"foo"),
+            b")",
+        ]
+        _results, errors = sm.parse_fetch_response(data)
+        self.assertTrue(
+            any("header for UID 5 claims INTERNALDATE but extraction failed" in e for e in errors),
+            f"expected specific header-extraction error, got: {errors!r}",
+        )
+        self.assertTrue(any("missing INTERNALDATE for UID 5" in e for e in errors))
+
+    def test_trailer_with_internaldate_keyword_collision_does_not_false_positive(self):
+        # A custom IMAP keyword literally named INTERNALDATE in a FLAGS list shouldn't trip
+        # the trailer gate. The real INTERNALDATE field (with its opening quote) does.
+        data = [
+            (b"1 (UID 5 RFC822 {3}", b"foo"),
+            b' FLAGS (\\Seen INTERNALDATE \\Answered) INTERNALDATE "01-Jan-2026 12:00:00 +0000")',
+        ]
+        results, errors = sm.parse_fetch_response(data)
+        self.assertEqual(results, [(5, b"foo", "01-Jan-2026 12:00:00 +0000")])
         self.assertEqual(errors, [])
 
 
