@@ -82,8 +82,10 @@ class ReadUIState:
     `offset` is the top visible row — viewport follows the cursor minimally (only scrolls
     when the cursor would go off-screen). `page_size` is recomputed from terminal height
     each frame. `find_mode` is the editing sub-state: when True, keystrokes feed the
-    find editor and the bottom row shows the live prompt. `enabled_folders` empty =
-    "all live folders" (default). `read_overrides` is reserved for the local read/unread
+    find editor and the bottom row shows the live prompt. `enabled_folders` is None when
+    no folder filter is active (default, show all live entries); a set (including the
+    empty set) means the filter is on — empty set is a deliberate "show nothing" state,
+    not the same as no filter. `read_overrides` is reserved for the local read/unread
     feature (pass 4)."""
 
     cursor: int = 0
@@ -92,7 +94,7 @@ class ReadUIState:
     digit_buffer: str = ""
     find_query: str = ""
     find_mode: bool = False
-    enabled_folders: set = field(default_factory=set)
+    enabled_folders: set | None = None
     read_overrides: dict = field(default_factory=dict)
 
 
@@ -918,11 +920,19 @@ def is_live(entry):
 
 
 def _entries_visible(all_entries, state):
-    """Apply session UI filters (find query, enabled folders) to the already-live entries list.
-    Composes both filters with AND. Pass 5 adds the folder branch; pass 3 ships only find."""
+    """Apply session UI filters (folder set, find query) to the already-live entries list.
+    Both filters compose with AND. `enabled_folders` is None when no folder filter is
+    active; a set (including the empty set) when active — empty set is a deliberate
+    "show nothing" state. Folder match requires a *live* history entry in an enabled
+    folder, not just any history record — keeps removed-from-folder entries from
+    re-appearing via the filter."""
     q = state.find_query.lower() if state.find_query else ""
+    folders = state.enabled_folders
     out = []
     for h, e in all_entries:
+        if folders is not None:
+            if not any(hist["folder"] in folders and not hist.get("removed") for hist in e.get("history", [])):
+                continue
         if q:
             subj = (e.get("subject") or "").lower()
             frm = (e.get("from") or "").lower()
@@ -930,6 +940,16 @@ def _entries_visible(all_entries, state):
                 continue
         out.append((h, e))
     return out
+
+
+def _all_folders_from_entries(all_entries):
+    """Sorted union of every folder name appearing in any entry's history (live or removed).
+    Pass 6 will union this with folders mentioned in config presets."""
+    folders = set()
+    for _h, e in all_entries:
+        for hist in e.get("history", []):
+            folders.add(hist["folder"])
+    return sorted(folders)
 
 
 def is_gone(entry):
@@ -1312,6 +1332,74 @@ _HIDE_CURSOR = "\x1b[?25l"
 _SHOW_CURSOR = "\x1b[?25h"
 
 
+def _folder_menu_ui(state, all_entries):
+    """Modal folder filter. Mutates `state.enabled_folders` on Enter; leaves it untouched
+    on Esc/q. Working copy semantics: an empty stored set means 'no filter', shown as
+    'all ticked' in the menu so the visual matches the actual behavior."""
+    all_folders = _all_folders_from_entries(all_entries)
+    if not all_folders:
+        return
+    working = set(state.enabled_folders) if state.enabled_folders is not None else set(all_folders)
+    cursor = 0
+    offset = 0
+
+    while True:
+        try:
+            sz = os.get_terminal_size()
+            term_width = sz.columns
+            term_height = sz.lines
+        except (ValueError, OSError):
+            term_width, term_height = 80, 24
+        page_size = max(1, term_height - 5)
+
+        cursor = max(0, min(cursor, len(all_folders) - 1))
+        if cursor < offset:
+            offset = cursor
+        elif cursor >= offset + page_size:
+            offset = cursor - page_size + 1
+        offset = max(0, min(offset, max(0, len(all_folders) - page_size)))
+        start = offset
+        end = min(start + page_size, len(all_folders))
+
+        buf = [_HOME]
+        rule = f"{'─' * term_width}{_EOL}\n"
+        buf.append(rule)
+        buf.append(f"  Folder filter — {len(working)}/{len(all_folders)} enabled{_EOL}\n")
+        buf.append(rule)
+        for i, name in enumerate(all_folders[start:end]):
+            idx = start + i
+            marker = "▸ " if idx == cursor else "  "
+            box = "[X]" if name in working else "[ ]"
+            buf.append(f"{marker}{box} {safe_str(name, allow_newlines=False)}{_EOL}\n")
+        for _ in range(page_size - (end - start)):
+            buf.append(f"{_EOL}\n")
+        buf.append(rule)
+        bottom = "  i/k:line  space:toggle  Enter:apply  Esc:cancel"
+        buf.append(f"{bottom}{_EOL}{_EOS}")
+        print("".join(buf), end="", flush=True)
+
+        key = _read_key()
+        if key in ("\n", "\r"):
+            state.enabled_folders = working
+            return
+        if key in ("\x1b", "\x03", "q"):
+            return
+        if key == "i":
+            cursor -= 1
+        elif key == "k":
+            cursor += 1
+        elif key == "I":
+            cursor -= 10
+        elif key == "K":
+            cursor += 10
+        elif key == " ":
+            name = all_folders[cursor]
+            if name in working:
+                working.discard(name)
+            else:
+                working.add(name)
+
+
 def _read_emails_ui(account, snapshot, ctx):
     if not snapshot.messages:
         raise SMException(f"No emails found for account {account.name}. Run sync first.")
@@ -1380,6 +1468,8 @@ def _run_read_loop(account, snapshot, ctx, state, all_entries):
         # During editing, the live prompt at the bottom is the single source of truth.
         if state.find_query and not state.find_mode:
             header += f"   find: {state.find_query}"
+        if state.enabled_folders is not None:
+            header += f"   folders: {len(state.enabled_folders)}"
         buf.append(f"{header}{_EOL}\n")
         buf.append(rule)
         if entries:
@@ -1397,7 +1487,11 @@ def _run_read_loop(account, snapshot, ctx, state, all_entries):
             rendered = end - start
         else:
             # Empty list: center a hint mid-body, leave the rest blank.
-            hint = "no email with the current filters" if (state.find_query or state.enabled_folders) else "no email"
+            hint = (
+                "no email with the current filters"
+                if (state.find_query or state.enabled_folders is not None)
+                else "no email"
+            )
             mid = state.page_size // 2
             for r in range(state.page_size):
                 if r == mid:
@@ -1416,7 +1510,7 @@ def _run_read_loop(account, snapshot, ctx, state, all_entries):
             # applies to entries[] on next iteration when find_query changes.
             bottom = f"  find: {state.find_query}_   (Enter:apply  Esc:cancel  Backspace:delete)"
         else:
-            bottom = "  i/k:line  I/K:±10  j/l:edge  J/L:top/bot  Enter:open  #:jump  f:find"
+            bottom = "  i/k:line  I/K:±10  j/l:edge  J/L:top/bot  Enter:open  #:jump  f:find  m:folders"
             if ctx.errors:
                 bottom += f"  e:errors({len(ctx.errors)})"
             bottom += "  q:quit"
@@ -1450,12 +1544,16 @@ def _run_read_loop(account, snapshot, ctx, state, all_entries):
             continue
 
         # If the list is empty (find/folder filter matched nothing), navigation keys are
-        # meaningless. Only quit and find-mode entry stay live.
+        # meaningless. Only quit and filter-editing stay live so the user can recover.
         if not entries:
             if key in ("q", "\x03"):
                 return
             if key == "f":
                 state.find_mode = True
+            elif key == "m":
+                _folder_menu_ui(state, all_entries)
+                state.cursor = 0
+                state.offset = 0
             continue
 
         if key in ("q", "\x03"):
@@ -1512,6 +1610,11 @@ def _run_read_loop(account, snapshot, ctx, state, all_entries):
                 state.offset = 0
         elif key == "f":
             state.find_mode = True
+            state.digit_buffer = ""
+        elif key == "m":
+            _folder_menu_ui(state, all_entries)
+            state.cursor = 0
+            state.offset = 0
             state.digit_buffer = ""
         elif key in ("\n", "\r"):
             if state.digit_buffer:

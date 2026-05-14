@@ -2328,6 +2328,113 @@ class TestReadUIViewport(unittest.TestCase):
         self.assertIn("find: email 15", out)
 
 
+class TestReadUIFolderFilter(unittest.TestCase):
+    """Pass 5 coverage: the folder-enable/disable menu and its filter effect.
+
+    Fixture: 4 entries across 3 folders so the menu has real choices and we can verify
+    both inclusion and exclusion behavior.
+      - "inbox-only"     → INBOX
+      - "archive-only"   → Archive
+      - "both-folders"   → INBOX + Archive (live in both)
+      - "had-junk-now-archive" → Archive (live) + Junk (removed)
+    """
+
+    def setUp(self):
+        import json
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmppath = Path(self._tmp.name)
+        self._orig_lock = sm.LOCK_PATH
+        self._orig_config = sm.CONFIG_PATH
+        self._orig_argv = sm.argv
+        sm.LOCK_PATH = self.tmppath / "lock"
+        sm.CONFIG_PATH = self.tmppath / "config.json"
+        Store._active = False
+        config = {"accounts": [{"name": "test", "local_store_path": str(self.tmppath / "store")}]}
+        sm.CONFIG_PATH.write_text(json.dumps(config))
+
+        plan = [
+            ("inbox-only", "04-May-2026 12:00:00 +0000", [{"folder": "INBOX", "uid": 1}]),
+            ("archive-only", "03-May-2026 12:00:00 +0000", [{"folder": "Archive", "uid": 1}]),
+            (
+                "both-folders",
+                "02-May-2026 12:00:00 +0000",
+                [{"folder": "INBOX", "uid": 2}, {"folder": "Archive", "uid": 2}],
+            ),
+            (
+                "had-junk-now-archive",
+                "01-May-2026 12:00:00 +0000",
+                [{"folder": "Archive", "uid": 3}, {"folder": "Junk", "uid": 1, "removed": True}],
+            ),
+        ]
+        with Store(self.tmppath / "store") as store:
+            for subj, idate, history in plan:
+                body = _make_eml(subj)
+                content_hash = hashlib.sha256(body + subj.encode()).hexdigest()
+                (store.mails_path / f"{content_hash}.eml").write_bytes(body)
+                store.messages[content_hash] = {
+                    "subject": subj,
+                    "from": "s@example.com",
+                    "date": "Thu, 8 May 2026 14:30:00 +0000",
+                    "internaldate": idate,
+                    "history": history,
+                }
+            store.save()
+
+    def tearDown(self):
+        sm.LOCK_PATH = self._orig_lock
+        sm.CONFIG_PATH = self._orig_config
+        sm.argv = self._orig_argv
+        Store._active = False
+        self._tmp.cleanup()
+
+    def _run(self, keys):
+        sm.argv = ["sm", "read", "account=test"]
+        buf = io.StringIO()
+        with patch("sm._require_tty"), patch("sm._read_key", side_effect=keys):
+            with redirect_stdout(buf):
+                sm.main()
+        return buf.getvalue()
+
+    def test_folder_menu_lists_all_folders_from_history_including_removed(self):
+        # Open menu, immediately Esc (no change), then quit. All 3 folders must appear:
+        # INBOX, Archive, Junk (Junk only via a removed history entry).
+        out = self._run(["m", "\x1b", "q"])
+        self.assertIn("INBOX", out)
+        self.assertIn("Archive", out)
+        self.assertIn("Junk", out)
+
+    def test_folder_menu_cancel_preserves_filter(self):
+        # Open menu → space (toggle off the first folder = Archive alphabetically) → Esc.
+        # Cancel must not mutate state. All 4 entries still visible in the list.
+        out = self._run(["m", " ", "\x1b", "q"])
+        # Header shows 4 entries (entry 1/4).
+        self.assertIn("/4", out)
+
+    def test_folder_menu_apply_only_inbox(self):
+        # Folders sorted: ["Archive", "INBOX", "Junk"]. Cursor starts at 0 = Archive.
+        # Untick Archive (space), k → INBOX, leave ticked. k → Junk, untick (space). Enter.
+        # Result: only INBOX enabled → entries with a live INBOX history: "inbox-only" + "both-folders".
+        out = self._run(["m", " ", "k", "k", " ", "\n", "q"])
+        # Header reflects filter and reduced count.
+        self.assertIn("/2", out)
+        self.assertIn("folders: 1", out)
+
+    def test_folder_menu_disabling_all_yields_empty_list(self):
+        # Untick all 3 folders → Enter → no entries match → inline "no email" hint.
+        out = self._run(["m", " ", "k", " ", "k", " ", "\n", "q"])
+        self.assertIn("no email with the current filters", out)
+
+    def test_removed_history_entries_dont_satisfy_folder_filter(self):
+        # Enable Junk only. The "had-junk-now-archive" entry has Junk in history but it's
+        # removed=True, so it must NOT appear. Result: 0 visible entries.
+        # Folders alphabetical: Archive (cursor 0), INBOX (1), Junk (2).
+        # Untick Archive (space), k → INBOX, untick (space), k → Junk (already ticked). Enter.
+        out = self._run(["m", " ", "k", " ", "\n", "q"])
+        # With only Junk enabled and Junk's only history entry being removed, no entries match.
+        self.assertIn("no email with the current filters", out)
+
+
 class TestReadUIErrorRecording(unittest.TestCase):
     """End-to-end coverage of the read UI's error-handling story: each recoverable failure
     mode (missing .eml, parse exception, attachment-walk exception) lands as a `read_failed`
