@@ -147,6 +147,31 @@ def numbered_samples(n, start_idx=1):
     return out
 
 
+def multi_folder_samples(folders, n_per_folder=3):
+    """Generate samples scattered across the given folders, n_per_folder each, all live.
+    Subject and from carry the folder name so it's obvious which row lives where while
+    you drive the folder menu. Used by demo_folder_menu.py."""
+    base = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    out = []
+    counter = 0
+    for folder in folders:
+        # Sanitize folder name for the from-address local part (no slashes, brackets, etc.)
+        from_tag = folder.replace("/", "-").replace("[", "").replace("]", "").replace(" ", "_") or "x"
+        for i in range(1, n_per_folder + 1):
+            counter += 1
+            dt = base - timedelta(hours=counter)
+            out.append(
+                {
+                    "subject": f"[{folder}] message {i}",
+                    "from": f"sender-{from_tag}@example.com",
+                    "body": f"This message lives in folder: {folder}\n",
+                    "internaldate": dt.strftime("%d-%b-%Y %H:%M:%S +0000"),
+                    "folders": [folder],
+                }
+            )
+    return out
+
+
 def populate_store_with_samples(store, samples=None):
     """Write `samples` (default: SAMPLES) + per-folder UIDVALIDITY into the given Store
     (already entered)."""
@@ -212,17 +237,26 @@ def populate_ctx_with_errors(ctx, errors=None):
 
 
 @contextmanager
-def with_demo_store(extra_numbered=0):
-    """Set up a tempdir, override sm.LOCK_PATH, populate a Store with SAMPLES (plus
-    `extra_numbered` synthetic stress-test samples appended), yield (store_path, account, ctx).
-    Caller may pre-populate ctx.errors before invoking sm APIs. Tempdir is cleaned up on exit."""
+def with_demo_store(extra_numbered=0, samples=None, folder_presets=None):
+    """Set up a tempdir, override sm.LOCK_PATH, populate a Store, yield (store_path,
+    account, ctx).
+
+    If `samples` is provided it overrides the default mix (SAMPLES + numbered samples);
+    otherwise the default is used. `folder_presets` is passed through to the synthetic
+    MailConnectionInfos so demos can exercise the preset row in the folder menu.
+    Tempdir is cleaned up on exit."""
     with TemporaryDirectory(prefix="sm-demo-") as tmp:
         tmp_path = Path(tmp)
         sm.LOCK_PATH = tmp_path / ".lock"  # don't touch the real user's lock file
         store_path = tmp_path / "store"
-        samples = SAMPLES + (numbered_samples(extra_numbered) if extra_numbered > 0 else [])
+        if samples is None:
+            samples = SAMPLES + (numbered_samples(extra_numbered) if extra_numbered > 0 else [])
         with sm.Store(store_path) as store:
             populate_store_with_samples(store, samples)
         ctx = sm.Context()
-        account = sm.MailConnectionInfos(name="demo", local_store_path=str(store_path))
+        account = sm.MailConnectionInfos(
+            name="demo",
+            local_store_path=str(store_path),
+            folder_presets=folder_presets or {},
+        )
         yield store_path, account, ctx

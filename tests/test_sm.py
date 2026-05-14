@@ -2328,6 +2328,273 @@ class TestReadUIViewport(unittest.TestCase):
         self.assertIn("find: email 15", out)
 
 
+class TestReadUIFolderPresets(unittest.TestCase):
+    """Pass 6 coverage: config-defined folder presets, [none]/[custom] pseudo-presets,
+    j/l preset navigation, and persistence across sessions via state.json."""
+
+    def setUp(self):
+        import json
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmppath = Path(self._tmp.name)
+        self._orig_lock = sm.LOCK_PATH
+        self._orig_config = sm.CONFIG_PATH
+        self._orig_argv = sm.argv
+        sm.LOCK_PATH = self.tmppath / "lock"
+        sm.CONFIG_PATH = self.tmppath / "config.json"
+        Store._active = False
+        config = {
+            "accounts": [
+                {
+                    "name": "test",
+                    "local_store_path": str(self.tmppath / "store"),
+                    # "Work" is preset-only (no messages live there) — must still appear in the menu.
+                    "folder_presets": {"work": ["INBOX", "Work"]},
+                }
+            ],
+        }
+        sm.CONFIG_PATH.write_text(json.dumps(config))
+
+        plan = [
+            ("in-inbox", "04-May-2026 12:00:00 +0000", [{"folder": "INBOX", "uid": 1}]),
+            ("in-archive", "03-May-2026 12:00:00 +0000", [{"folder": "Archive", "uid": 1}]),
+        ]
+        with Store(self.tmppath / "store") as store:
+            for subj, idate, history in plan:
+                body = _make_eml(subj)
+                content_hash = hashlib.sha256(body + subj.encode()).hexdigest()
+                (store.mails_path / f"{content_hash}.eml").write_bytes(body)
+                store.messages[content_hash] = {
+                    "subject": subj,
+                    "from": "s@example.com",
+                    "date": "Thu, 8 May 2026 14:30:00 +0000",
+                    "internaldate": idate,
+                    "history": history,
+                }
+            store.save()
+
+    def tearDown(self):
+        sm.LOCK_PATH = self._orig_lock
+        sm.CONFIG_PATH = self._orig_config
+        sm.argv = self._orig_argv
+        Store._active = False
+        self._tmp.cleanup()
+
+    def _state_file(self):
+        return self.tmppath / "store" / "state.json"
+
+    def _run(self, keys):
+        sm.argv = ["sm", "read", "account=test"]
+        buf = io.StringIO()
+        with patch("sm._require_tty"), patch("sm._read_key", side_effect=keys):
+            with redirect_stdout(buf):
+                sm.main()
+        return buf.getvalue()
+
+    def test_modal_shows_preset_row_with_none_named_and_custom(self):
+        out = self._run(["m", "\x1b", "q"])
+        self.assertIn("[none]", out)
+        self.assertIn("work", out)
+        self.assertIn("[custom]", out)
+
+    def test_preset_only_folder_appears_in_folder_list(self):
+        # "Work" lives only in the preset; no message resides there. Must still show up.
+        out = self._run(["m", "\x1b", "q"])
+        self.assertIn("Work", out)
+
+    def test_applying_named_preset_sets_filter_and_persists(self):
+        # Preset order: [none](0), work(1), [custom](2). l moves preset cursor and
+        # live-applies the preset in one step; Enter commits.
+        out = self._run(["m", "l", "\n", "q"])
+        self.assertIn("entry 1/1", out)
+        # Header shows the preset name (intent), not a resolved folder count.
+        self.assertIn("filter: work", out)
+        import json
+
+        data = json.loads(self._state_file().read_text())
+        self.assertEqual(data["selection_current"], "work")
+        # Recovery snapshot stored so config drift doesn't silently drop the filter.
+        self.assertEqual(set(data["last_resolved"]), {"INBOX", "Work"})
+
+    def test_apply_none_preset_clears_filter(self):
+        # Pre-seed state.json with [custom]/INBOX. Modal opens with cursor on [custom] (idx 2).
+        # j j moves the preset cursor 2 → 1 → 0 and live-applies along the way; final state
+        # is [none]. Enter commits.
+        import json
+
+        self._state_file().parent.mkdir(parents=True, exist_ok=True)
+        self._state_file().write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "selection_current": "[custom]",
+                    "folders_selected_in_custom": ["INBOX"],
+                    "last_resolved": ["INBOX"],
+                }
+            )
+        )
+        out = self._run(["m", "j", "j", "\n", "q"])
+        self.assertIn("entry 1/2", out)
+        data = json.loads(self._state_file().read_text())
+        self.assertEqual(data["selection_current"], "[none]")
+        self.assertIsNone(data["last_resolved"])
+
+    def test_state_persists_across_sessions(self):
+        # Session 1: l live-applies work, Enter commits.
+        self._run(["m", "l", "\n", "q"])
+        # Session 2: just quit — the filter should still be active and the preset name visible.
+        out = self._run(["q"])
+        self.assertIn("filter: work", out)
+
+    def test_esc_in_modal_does_not_persist(self):
+        # Open menu, toggle a folder via Space (cursor at folder), then Esc — no save.
+        self._run(["m", " ", "\x1b", "q"])
+        self.assertFalse(self._state_file().exists())
+
+    def test_editing_folder_writes_to_custom_folders(self):
+        # Folders sorted: Archive(0), INBOX(1), Work(2). Filter starts off → working=all ticked.
+        # Space on Archive (cursor 0): filter on, working = {INBOX, Work}. State rolls to [custom].
+        self._run(["m", " ", "\n", "q"])
+        import json
+
+        data = json.loads(self._state_file().read_text())
+        self.assertEqual(data["selection_current"], "[custom]")
+        self.assertEqual(set(data["folders_selected_in_custom"]), {"INBOX", "Work"})
+        self.assertEqual(set(data["last_resolved"]), {"INBOX", "Work"})
+
+    def test_corrupt_state_json_falls_back_to_no_filter(self):
+        self._state_file().parent.mkdir(parents=True, exist_ok=True)
+        self._state_file().write_text("not json {")
+        out = self._run(["q"])
+        # Both entries visible, no filter active.
+        self.assertIn("entry 1/2", out)
+        self.assertNotIn("filter:", out)
+
+    def test_preset_edit_in_config_auto_applies_next_session(self):
+        # The whole point of storing *intent* instead of resolved set.
+        # Session 1: l live-applies "work" → state has selection_current="work".
+        self._run(["m", "l", "\n", "q"])
+
+        # Now mutate the config: "work" gains an extra folder ("Archive").
+        import json
+
+        cfg = json.loads(sm.CONFIG_PATH.read_text())
+        cfg["accounts"][0]["folder_presets"]["work"] = ["INBOX", "Work", "Archive"]
+        sm.CONFIG_PATH.write_text(json.dumps(cfg))
+
+        # Session 2: filter resolves against the new preset → now includes Archive too,
+        # so "in-archive" appears in the visible list.
+        out = self._run(["q"])
+        # Header still says "filter: work" (intent, not resolved set).
+        self.assertIn("filter: work", out)
+        # Both entries (in-inbox + in-archive) now match the broadened preset.
+        self.assertIn("entry 1/2", out)
+
+    def test_dangling_preset_main_loop_uses_last_resolved_recovery(self):
+        """A dangling preset name in state.json must not lose the user's filter at read time.
+        Session 1 selects 'work' (last_resolved cached). Then the preset is deleted from
+        config. Session 2 must still show the filtered list (no crash, no silent drop)
+        without rewriting state.json (no modal opened)."""
+        self._run(["m", "l", "\n", "q"])
+        import json
+
+        cfg = json.loads(sm.CONFIG_PATH.read_text())
+        del cfg["accounts"][0]["folder_presets"]["work"]
+        sm.CONFIG_PATH.write_text(json.dumps(cfg))
+
+        out = self._run(["q"])
+        # Filter still resolves to {INBOX, Work} via last_resolved; only "in-inbox" matches.
+        self.assertIn("entry 1/1", out)
+        # state.json untouched this session (no modal commit) — still references the
+        # deleted preset by name. Recovery is via last_resolved at read time only.
+        data = json.loads(self._state_file().read_text())
+        self.assertEqual(data["selection_current"], "work")
+        self.assertEqual(set(data["last_resolved"]), {"INBOX", "Work"})
+
+    def test_dangling_preset_modal_commit_normalizes_to_custom(self):
+        """Opening the modal in a dangling state should land in [custom] (seeded from
+        last_resolved). Pressing Enter must persist the normalized form: selection_current
+        becomes '[custom]' and the recovered folder set is saved as folders_selected_in_custom."""
+        self._run(["m", "l", "\n", "q"])
+        import json
+
+        cfg = json.loads(sm.CONFIG_PATH.read_text())
+        del cfg["accounts"][0]["folder_presets"]["work"]
+        sm.CONFIG_PATH.write_text(json.dumps(cfg))
+
+        # Session 2: open modal, immediately Enter to commit (no edits) → normalize.
+        self._run(["m", "\n", "q"])
+        data = json.loads(self._state_file().read_text())
+        self.assertEqual(data["selection_current"], "[custom]")
+        self.assertEqual(set(data["folders_selected_in_custom"]), {"INBOX", "Work"})
+        # last_resolved gets recomputed to match the new selection (set([INBOX, Work]) for [custom]).
+        self.assertEqual(set(data["last_resolved"]), {"INBOX", "Work"})
+
+    def test_dangling_preset_with_no_recovery_falls_to_none(self):
+        """Hand-crafted edge case: state.json names a missing preset, no last_resolved,
+        no folders_selected_in_custom. The main loop must show no filter (not an empty-
+        set [custom] that hides everything), and opening the modal + Enter must normalize
+        to [none] rather than landing in a no-folders-ticked [custom] trap."""
+        import json
+
+        self._state_file().parent.mkdir(parents=True, exist_ok=True)
+        self._state_file().write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "selection_current": "gone_preset",
+                    "folders_selected_in_custom": None,
+                    "last_resolved": None,
+                }
+            )
+        )
+        # Main loop: filter resolves to None (no recovery data), full list visible.
+        out = self._run(["q"])
+        self.assertIn("entry 1/2", out)
+
+        # Modal commit normalizes to [none] (clean drop, not empty-set [custom]).
+        self._run(["m", "\n", "q"])
+        data = json.loads(self._state_file().read_text())
+        self.assertEqual(data["selection_current"], "[none]")
+        self.assertIsNone(data["last_resolved"])
+
+    def test_l_live_applies_preset_without_space(self):
+        """j/l should apply the preset on the move — no separate Space confirmation.
+        Pressing l alone (no Space) and then Enter should commit the work preset.
+        If j/l were navigation-only (old behavior), Enter at this point would commit
+        the still-active [none] state and no filter would persist."""
+        self._run(["m", "l", "\n", "q"])
+        import json
+
+        data = json.loads(self._state_file().read_text())
+        self.assertEqual(data["selection_current"], "work")
+
+    def test_dangling_preset_with_existing_custom_preserves_custom(self):
+        """When state has both a dangling preset name AND a separate folders_selected_in_custom,
+        the modal recovers to [custom] preserving the existing custom set (preferred over
+        last_resolved, which represents the now-gone preset). On commit, the dangling name
+        is replaced with [custom] and folders_selected_in_custom stays intact."""
+        import json
+
+        self._state_file().parent.mkdir(parents=True, exist_ok=True)
+        self._state_file().write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "selection_current": "gone_preset",
+                    "folders_selected_in_custom": ["INBOX"],
+                    "last_resolved": ["Archive"],  # different from custom — must not win
+                }
+            )
+        )
+        self._run(["m", "\n", "q"])
+        data = json.loads(self._state_file().read_text())
+        self.assertEqual(data["selection_current"], "[custom]")
+        # Custom preserved (was [INBOX]), not overwritten by last_resolved's [Archive].
+        self.assertEqual(set(data["folders_selected_in_custom"]), {"INBOX"})
+        self.assertEqual(set(data["last_resolved"]), {"INBOX"})
+
+
 class TestReadUIFolderFilter(unittest.TestCase):
     """Pass 5 coverage: the folder-enable/disable menu and its filter effect.
 
@@ -2418,7 +2685,8 @@ class TestReadUIFolderFilter(unittest.TestCase):
         out = self._run(["m", " ", "k", "k", " ", "\n", "q"])
         # Header reflects filter and reduced count.
         self.assertIn("/2", out)
-        self.assertIn("folders: 1", out)
+        # Editing folders puts the session into the [custom] selection.
+        self.assertIn("filter: [custom]", out)
 
     def test_folder_menu_disabling_all_yields_empty_list(self):
         # Untick all 3 folders → Enter → no entries match → inline "no email" hint.

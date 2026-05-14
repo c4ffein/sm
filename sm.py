@@ -94,8 +94,19 @@ class ReadUIState:
     digit_buffer: str = ""
     find_query: str = ""
     find_mode: bool = False
-    enabled_folders: set | None = None
-    read_overrides: dict = field(default_factory=dict)
+    # Active preset selection — a string tag, not a resolved set. "[none]" = no filter,
+    # "[custom]" = use folders_selected_in_custom, anything else = a config preset name.
+    # We store the tag (intent) instead of the folder set so editing a preset's folders
+    # in config.json auto-applies on next sm read. Resolution happens via _resolve_filter
+    # against the in-memory presets dict (loaded once at startup, not re-read per frame).
+    selection_current: str = "[none]"
+    # The [custom] preset's folder set — preserved across modal sessions and runs.
+    # None until the user has actually edited folders.
+    folders_selected_in_custom: set | None = None
+    # Recovery snapshot for the case where selection_current names a config preset that
+    # has been deleted since last save. Treated as a one-off [custom] in that case so
+    # the user doesn't lose their filter to a config drift.
+    last_resolved: set | None = None
 
 
 @dataclass
@@ -431,6 +442,10 @@ class MailConnectionInfos:
     password: str = None
     local_store_path: str = None
     ssl_cafile: str = None
+    # Optional: named folder filter presets shown in the read UI's folder menu, e.g.
+    # {"business": ["Work", "Projects"], "personal": ["INBOX", "Family"]}. Pressing
+    # space on a preset overwrites the folder ticks to that set.
+    folder_presets: dict = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: dict):
@@ -919,7 +934,7 @@ def is_live(entry):
     return any(not h.get("removed") for h in entry.get("history", []))
 
 
-def _entries_visible(all_entries, state):
+def _entries_visible(all_entries, state, enabled_folders):
     """Apply session UI filters (folder set, find query) to the already-live entries list.
     Both filters compose with AND. `enabled_folders` is None when no folder filter is
     active; a set (including the empty set) when active — empty set is a deliberate
@@ -927,7 +942,7 @@ def _entries_visible(all_entries, state):
     folder, not just any history record — keeps removed-from-folder entries from
     re-appearing via the filter."""
     q = state.find_query.lower() if state.find_query else ""
-    folders = state.enabled_folders
+    folders = enabled_folders
     out = []
     for h, e in all_entries:
         if folders is not None:
@@ -942,14 +957,86 @@ def _entries_visible(all_entries, state):
     return out
 
 
-def _all_folders_from_entries(all_entries):
-    """Sorted union of every folder name appearing in any entry's history (live or removed).
-    Pass 6 will union this with folders mentioned in config presets."""
+def _all_folders_from_entries(all_entries, presets=None):
+    """Sorted union of every folder name in entry history plus every folder named by any
+    config preset. Preset-mentioned folders that have no messages locally still show up
+    in the filter menu so the user can opt into them — your earlier suggestion that we
+    don't need a separate 'missing' UX state."""
     folders = set()
     for _h, e in all_entries:
         for hist in e.get("history", []):
             folders.add(hist["folder"])
+    if presets:
+        for preset_folders in presets.values():
+            folders.update(preset_folders)
     return sorted(folders)
+
+
+STATE_VERSION = 1
+
+
+def _state_path(local_store_path):
+    return Path(local_store_path) / "state.json"
+
+
+def _resolve_filter(selection_current, folders_selected_in_custom, last_resolved, presets):
+    """Turn a selection tag + auxiliary state into the actual folder filter set.
+    None return = no filter (filter off). A set = filter on with those folders.
+
+    `presets` is the in-memory dict from `account.folder_presets`, parsed once at sm
+    startup — this function does no disk I/O.
+
+    Resolution order: "[none]" → None, "[custom]" → user's custom set, named preset
+    that's still in the presets dict → its current folders, named preset that's been
+    deleted from config since the state was saved → last_resolved (so config drift
+    doesn't silently lose the user's filter), nothing usable → None."""
+    if selection_current == "[none]":
+        return None
+    if selection_current == "[custom]":
+        return set(folders_selected_in_custom) if folders_selected_in_custom is not None else set()
+    if selection_current in presets:
+        return set(presets[selection_current])
+    if last_resolved is not None:
+        return set(last_resolved)
+    return None
+
+
+def _load_folder_state(local_store_path):
+    """Return (selection_current, folders_selected_in_custom, last_resolved).
+    selection_current is a string (defaults to "[none]"); the other two are sets or None.
+    Missing or corrupt state.json → defaults."""
+    path = _state_path(local_store_path)
+    defaults = ("[none]", None, None)
+    if not path.exists():
+        return defaults
+    try:
+        data = loads(path.read_text())
+    except (OSError, JSONDecodeError):
+        return defaults
+    sel = data.get("selection_current")
+    if not isinstance(sel, str):
+        sel = "[none]"
+
+    def _as_set(value):
+        return set(value) if isinstance(value, list) else None
+
+    return sel, _as_set(data.get("folders_selected_in_custom")), _as_set(data.get("last_resolved"))
+
+
+def _save_folder_state(local_store_path, selection_current, folders_selected_in_custom, last_resolved):
+    """Persist via atomic temp + rename. Sets serialize as sorted lists; None as json null."""
+    path = _state_path(local_store_path)
+    temp_path = path.with_name(".state.json.tmp")
+    payload = {
+        "version": STATE_VERSION,
+        "selection_current": selection_current,
+        "folders_selected_in_custom": sorted(folders_selected_in_custom)
+        if folders_selected_in_custom is not None
+        else None,
+        "last_resolved": sorted(last_resolved) if last_resolved is not None else None,
+    }
+    temp_path.write_text(dumps(payload, indent=2))
+    temp_path.rename(path)
 
 
 def is_gone(entry):
@@ -1332,16 +1419,66 @@ _HIDE_CURSOR = "\x1b[?25l"
 _SHOW_CURSOR = "\x1b[?25h"
 
 
-def _folder_menu_ui(state, all_entries):
-    """Modal folder filter. Mutates `state.enabled_folders` on Enter; leaves it untouched
-    on Esc/q. Working copy semantics: an empty stored set means 'no filter', shown as
-    'all ticked' in the menu so the visual matches the actual behavior."""
-    all_folders = _all_folders_from_entries(all_entries)
+def _folder_menu_ui(state, all_entries, account):
+    """Modal folder filter with config presets + persisted custom state.
+
+    Preset row layout:
+      [none]   <named presets from config…>   [custom]
+    - [none] = filter off (show everything live).
+    - [custom] = the user's last freely-edited folder set.
+    - A named preset is "active" iff working_selection equals its name.
+
+    Storage model (new in Pass 6 refactor): we track *intent* — which preset is selected
+    — not the resolved folder set. Editing a folder while on a named preset rolls into
+    [custom] with the edited set. Navigating to a named preset does NOT touch custom.
+    Resolution against live config happens at read time, so preset edits in config
+    auto-apply next session.
+
+    Keys: i/k move the folder cursor, j/l move the preset cursor AND apply that preset
+    immediately (live preview — the folder ticks reflect the new selection right away).
+    Space toggles the folder under the i/k cursor (rolling the selection into [custom]).
+    Enter commits + persists; Esc cancels. Mutates state.selection_current +
+    folders_selected_in_custom + last_resolved on Enter only."""
+    presets = account.folder_presets or {}
+    all_folders = _all_folders_from_entries(all_entries, presets)
     if not all_folders:
         return
-    working = set(state.enabled_folders) if state.enabled_folders is not None else set(all_folders)
-    cursor = 0
-    offset = 0
+
+    preset_labels = ["[none]"] + list(presets.keys()) + ["[custom]"]
+
+    # Initialize working state from persisted state. If the saved selection_current
+    # references a preset that's since been deleted, recover into "[custom]" if there's
+    # anything to recover with (existing custom state preferred over last_resolved
+    # snapshot); else fall cleanly to "[none]" rather than landing in an empty-set
+    # "[custom]" that would hide everything.
+    working_selection = state.selection_current
+    working_custom = set(state.folders_selected_in_custom) if state.folders_selected_in_custom is not None else None
+    if working_selection not in ("[none]", "[custom]") and working_selection not in presets:
+        if working_custom is not None:
+            working_selection = "[custom]"
+        elif state.last_resolved is not None:
+            working_custom = set(state.last_resolved)
+            working_selection = "[custom]"
+        else:
+            working_selection = "[none]"
+
+    def working_resolved():
+        """Resolve the working selection to (folder_set, filter_off)."""
+        if working_selection == "[none]":
+            return None, True
+        if working_selection == "[custom]":
+            return (set(working_custom) if working_custom is not None else set()), False
+        return set(presets[working_selection]), False
+
+    def preset_idx_of(name):
+        try:
+            return preset_labels.index(name)
+        except ValueError:
+            return 0
+
+    preset_cursor = preset_idx_of(working_selection)
+    folder_cursor = 0
+    folder_offset = 0
 
     while True:
         try:
@@ -1350,54 +1487,99 @@ def _folder_menu_ui(state, all_entries):
             term_height = sz.lines
         except (ValueError, OSError):
             term_width, term_height = 80, 24
-        page_size = max(1, term_height - 5)
+        # 7 lines of chrome: 3 rules, header, preset row, padding rule, bottom.
+        page_size = max(1, term_height - 7)
 
-        cursor = max(0, min(cursor, len(all_folders) - 1))
-        if cursor < offset:
-            offset = cursor
-        elif cursor >= offset + page_size:
-            offset = cursor - page_size + 1
-        offset = max(0, min(offset, max(0, len(all_folders) - page_size)))
-        start = offset
+        folder_cursor = max(0, min(folder_cursor, len(all_folders) - 1))
+        if folder_cursor < folder_offset:
+            folder_offset = folder_cursor
+        elif folder_cursor >= folder_offset + page_size:
+            folder_offset = folder_cursor - page_size + 1
+        folder_offset = max(0, min(folder_offset, max(0, len(all_folders) - page_size)))
+        start = folder_offset
         end = min(start + page_size, len(all_folders))
 
+        working_set, filter_off = working_resolved()
         buf = [_HOME]
         rule = f"{'─' * term_width}{_EOL}\n"
         buf.append(rule)
-        buf.append(f"  Folder filter — {len(working)}/{len(all_folders)} enabled{_EOL}\n")
+        count_label = "all" if filter_off else str(len(working_set))
+        buf.append(f"  Folder filter — {count_label}/{len(all_folders)}   active: {working_selection}{_EOL}\n")
+        buf.append(rule)
+        # Active preset is shown by color alone. The j/l cursor is kept in sync with
+        # working_selection elsewhere (Space-on-folder updates both), so we don't need
+        # a separate marker — color = active = where j/l would navigate from.
+        preset_row = "  Presets:  "
+        for label in preset_labels:
+            chunk = label
+            if label == working_selection:
+                chunk = f"{Color.PURP.value}{chunk}{Color.WHITE.value}"
+            preset_row += chunk + "  "
+        buf.append(f"{preset_row.rstrip()}{_EOL}\n")
         buf.append(rule)
         for i, name in enumerate(all_folders[start:end]):
             idx = start + i
-            marker = "▸ " if idx == cursor else "  "
-            box = "[X]" if name in working else "[ ]"
+            marker = "▸ " if idx == folder_cursor else "  "
+            ticked = filter_off or (name in working_set)
+            box = "[X]" if ticked else "[ ]"
             buf.append(f"{marker}{box} {safe_str(name, allow_newlines=False)}{_EOL}\n")
         for _ in range(page_size - (end - start)):
             buf.append(f"{_EOL}\n")
         buf.append(rule)
-        bottom = "  i/k:line  space:toggle  Enter:apply  Esc:cancel"
+        bottom = "  i/k:folder  j/l:preset(live)  space:toggle  Enter:apply  Esc:cancel"
         buf.append(f"{bottom}{_EOL}{_EOS}")
         print("".join(buf), end="", flush=True)
 
         key = _read_key()
         if key in ("\n", "\r"):
-            state.enabled_folders = working
+            state.selection_current = working_selection
+            state.folders_selected_in_custom = set(working_custom) if working_custom is not None else None
+            state.last_resolved = _resolve_filter(working_selection, working_custom, None, presets)
+            _save_folder_state(
+                account.local_store_path,
+                state.selection_current,
+                state.folders_selected_in_custom,
+                state.last_resolved,
+            )
             return
         if key in ("\x1b", "\x03", "q"):
             return
         if key == "i":
-            cursor -= 1
+            folder_cursor -= 1
         elif key == "k":
-            cursor += 1
+            folder_cursor += 1
         elif key == "I":
-            cursor -= 10
+            folder_cursor -= 10
         elif key == "K":
-            cursor += 10
-        elif key == " ":
-            name = all_folders[cursor]
-            if name in working:
-                working.discard(name)
+            folder_cursor += 10
+        elif key in ("j", "l"):
+            if key == "j":
+                preset_cursor = max(0, preset_cursor - 1)
             else:
-                working.add(name)
+                preset_cursor = min(len(preset_labels) - 1, preset_cursor + 1)
+            # Live-apply: moving the preset cursor immediately applies that preset, so
+            # the folder ticks update as a preview. No separate "Space to apply" step.
+            target = preset_labels[preset_cursor]
+            if target == "[custom]" and working_custom is None:
+                # First-time landing on [custom] with no prior custom: seed it from the
+                # current visible set so the preview isn't an empty-checkboxes surprise.
+                cur_set, off = working_resolved()
+                working_custom = set(all_folders) if off else set(cur_set)
+            working_selection = target
+        elif key == " ":
+            # Toggle the folder under the i/k cursor. Rolls the selection into [custom]
+            # and moves the preset cursor to track it, so the color indicator stays in
+            # sync and a subsequent j/l move starts from the right place.
+            cur_set, off = working_resolved()
+            effective = set(all_folders) if off else set(cur_set)
+            name = all_folders[folder_cursor]
+            if name in effective:
+                effective.discard(name)
+            else:
+                effective.add(name)
+            working_custom = effective
+            working_selection = "[custom]"
+            preset_cursor = preset_idx_of("[custom]")
 
 
 def _read_emails_ui(account, snapshot, ctx):
@@ -1411,6 +1593,9 @@ def _read_emails_ui(account, snapshot, ctx):
 
     _require_tty()
     state = ReadUIState()
+    state.selection_current, state.folders_selected_in_custom, state.last_resolved = _load_folder_state(
+        account.local_store_path
+    )
 
     print(_HIDE_CURSOR, end="")
     try:
@@ -1433,7 +1618,13 @@ def _run_read_loop(account, snapshot, ctx, state, all_entries):
         # page nav (below) uses the current page_size.
         state.page_size = max(1, term_height - 5)
 
-        entries = _entries_visible(all_entries, state)
+        enabled_folders = _resolve_filter(
+            state.selection_current,
+            state.folders_selected_in_custom,
+            state.last_resolved,
+            account.folder_presets,
+        )
+        entries = _entries_visible(all_entries, state, enabled_folders)
 
         # Cursor/offset clamping. Empty list is a normal render with a hint, not a special
         # screen — keeps the user's context (header, chrome, bottom row) intact.
@@ -1468,8 +1659,8 @@ def _run_read_loop(account, snapshot, ctx, state, all_entries):
         # During editing, the live prompt at the bottom is the single source of truth.
         if state.find_query and not state.find_mode:
             header += f"   find: {state.find_query}"
-        if state.enabled_folders is not None:
-            header += f"   folders: {len(state.enabled_folders)}"
+        if state.selection_current != "[none]":
+            header += f"   filter: {state.selection_current}"
         buf.append(f"{header}{_EOL}\n")
         buf.append(rule)
         if entries:
@@ -1489,7 +1680,7 @@ def _run_read_loop(account, snapshot, ctx, state, all_entries):
             # Empty list: center a hint mid-body, leave the rest blank.
             hint = (
                 "no email with the current filters"
-                if (state.find_query or state.enabled_folders is not None)
+                if (state.find_query or state.selection_current != "[none]")
                 else "no email"
             )
             mid = state.page_size // 2
@@ -1551,7 +1742,7 @@ def _run_read_loop(account, snapshot, ctx, state, all_entries):
             if key == "f":
                 state.find_mode = True
             elif key == "m":
-                _folder_menu_ui(state, all_entries)
+                _folder_menu_ui(state, all_entries, account)
                 state.cursor = 0
                 state.offset = 0
             continue
@@ -1612,7 +1803,7 @@ def _run_read_loop(account, snapshot, ctx, state, all_entries):
             state.find_mode = True
             state.digit_buffer = ""
         elif key == "m":
-            _folder_menu_ui(state, all_entries)
+            _folder_menu_ui(state, all_entries, account)
             state.cursor = 0
             state.offset = 0
             state.digit_buffer = ""
@@ -1691,6 +1882,7 @@ def usage(wrong_config=False, wrong_command=False):
         '    "pinned_smtp_certificate_sha256": "XX"',
         '    "local_store_path": "XX"',
         '    "ssl_cafile": "/optional/override"  (overrides global)',
+        '    "folder_presets": {"business": ["Work", "Projects"], "personal": ["INBOX"]}  (optional, for read UI)',
         "───────────────────────",
         "- sm send recipient=a@b.com [recipient=c@d.com ...] subject=title body=something [account=name] [file=path]",
         "- sm sync [account=name] [yes] [verbose=0|1|2]      ──➤ fetch new + review deletions/moves",
