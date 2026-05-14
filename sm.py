@@ -95,7 +95,9 @@ class ReadUIState:
     find_query: str = ""
     find_mode: bool = False
     enabled_folders: set | None = None
-    read_overrides: dict = field(default_factory=dict)
+    # Set of content hashes the user has marked read. Persisted to state.json next to
+    # index.json; loaded on UI entry. Local-only — \Seen is not pushed back to IMAP.
+    read: set = field(default_factory=set)
 
 
 @dataclass
@@ -952,6 +954,38 @@ def _all_folders_from_entries(all_entries):
     return sorted(folders)
 
 
+STATE_VERSION = 1
+
+
+def _state_path(local_store_path):
+    return Path(local_store_path) / "state.json"
+
+
+def _load_read_state(local_store_path):
+    """Return the set of content hashes the user has marked read. Missing or unreadable
+    file → empty set (a corrupt state.json shouldn't bomb the UI). Pass 6 will extend the
+    file with folder preset state; that's why version is stored."""
+    path = _state_path(local_store_path)
+    if not path.exists():
+        return set()
+    try:
+        data = loads(path.read_text())
+    except (OSError, JSONDecodeError):
+        return set()
+    read = data.get("read", [])
+    return set(read) if isinstance(read, list) else set()
+
+
+def _save_read_state(local_store_path, read_set):
+    """Persist the read set to state.json via atomic temp + rename, matching Store.save's
+    pattern. Local-only — never push \\Seen back to the IMAP server."""
+    path = _state_path(local_store_path)
+    temp_path = path.with_name(".state.json.tmp")
+    payload = {"version": STATE_VERSION, "read": sorted(read_set)}
+    temp_path.write_text(dumps(payload, indent=2))
+    temp_path.rename(path)
+
+
 def is_gone(entry):
     """True iff the message has no live folder location anywhere we've synced.
     Equivalent to `not is_live(entry)`. See `_sync_apply` for the eventual-consistency contract:
@@ -1411,6 +1445,7 @@ def _read_emails_ui(account, snapshot, ctx):
 
     _require_tty()
     state = ReadUIState()
+    state.read = _load_read_state(account.local_store_path)
 
     print(_HIDE_CURSOR, end="")
     try:
@@ -1473,7 +1508,7 @@ def _run_read_loop(account, snapshot, ctx, state, all_entries):
         buf.append(f"{header}{_EOL}\n")
         buf.append(rule)
         if entries:
-            for i, (_content_hash, entry) in enumerate(entries[start:end]):
+            for i, (content_hash, entry) in enumerate(entries[start:end]):
                 num = start + i + 1
                 frm = safe_str(entry.get("from", "")[:30], allow_newlines=False)
                 date = format_date(entry.get("date", ""))
@@ -1483,7 +1518,12 @@ def _run_read_loop(account, snapshot, ctx, state, all_entries):
                 max_subj = term_width - len(prefix) - 1
                 if max_subj > 0 and len(subj) > max_subj:
                     subj = subj[: max_subj - 1] + "…"
-                buf.append(f"{prefix}{subj}{_EOL}\n")
+                # Read rows render dim (\x1b[90m); reset back to default at end-of-row so
+                # the _EOL erase and following lines aren't affected.
+                if content_hash in state.read:
+                    buf.append(f"{Color.DIM.value}{prefix}{subj}{Color.WHITE.value}{_EOL}\n")
+                else:
+                    buf.append(f"{prefix}{subj}{_EOL}\n")
             rendered = end - start
         else:
             # Empty list: center a hint mid-body, leave the rest blank.
@@ -1510,7 +1550,7 @@ def _run_read_loop(account, snapshot, ctx, state, all_entries):
             # applies to entries[] on next iteration when find_query changes.
             bottom = f"  find: {state.find_query}_   (Enter:apply  Esc:cancel  Backspace:delete)"
         else:
-            bottom = "  i/k:line  I/K:±10  j/l:edge  J/L:top/bot  Enter:open  #:jump  f:find  m:folders"
+            bottom = "  i/k:line  I/K:±10  j/l:edge  J/L:top/bot  Enter:open  r:read  #:jump  f:find  m:folders"
             if ctx.errors:
                 bottom += f"  e:errors({len(ctx.errors)})"
             bottom += "  q:quit"
@@ -1616,6 +1656,14 @@ def _run_read_loop(account, snapshot, ctx, state, all_entries):
             state.cursor = 0
             state.offset = 0
             state.digit_buffer = ""
+        elif key == "r":
+            content_hash, _entry = entries[state.cursor]
+            if content_hash in state.read:
+                state.read.discard(content_hash)
+            else:
+                state.read.add(content_hash)
+            _save_read_state(account.local_store_path, state.read)
+            state.digit_buffer = ""
         elif key in ("\n", "\r"):
             if state.digit_buffer:
                 idx = int(state.digit_buffer) - 1
@@ -1624,6 +1672,9 @@ def _run_read_loop(account, snapshot, ctx, state, all_entries):
                     continue
                 state.cursor = idx
             content_hash, entry = entries[state.cursor]
+            if content_hash not in state.read:
+                state.read.add(content_hash)
+                _save_read_state(account.local_store_path, state.read)
             if _view_email_ui(content_hash, entry, snapshot, ctx, term_width) == "quit":
                 return
         elif key == "e" and ctx.errors:
