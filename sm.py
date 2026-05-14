@@ -47,6 +47,9 @@ from ssl import (
 )
 from sys import argv
 from sys import flags as sys_flags
+from sys import stdin as sys_stdin
+from termios import TCSADRAIN, tcgetattr, tcsetattr
+from tty import setraw
 from urllib.error import HTTPError
 
 CONFIG_PATH = Path.home() / ".config" / "sm" / "config.json"
@@ -71,6 +74,23 @@ class ErrorEvent:
     kind: str  # "parse_list", "select_failed", "select_error", ...
     detail: str  # human-readable, sanitized
     raw: bytes = None  # the original bytes/repr if useful for debug
+
+
+@dataclass
+class ReadUIState:
+    """Session state for the read UI. Lives inside `_read_emails_ui`; not persisted.
+    `offset` is the top visible row — viewport follows the cursor minimally (only scrolls
+    when the cursor would go off-screen). `page_size` is recomputed from terminal height
+    each frame. `enabled_folders` empty = "all live folders" (default). `read_overrides`
+    is reserved for the local read/unread feature (pass 4)."""
+
+    cursor: int = 0
+    offset: int = 0
+    page_size: int = 20
+    digit_buffer: str = ""
+    find_query: str = ""
+    enabled_folders: set = field(default_factory=set)
+    read_overrides: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -1219,6 +1239,33 @@ def _load_message_for_display(content_hash, mails_path, ctx):
         return None
 
 
+def _require_tty():
+    """Raise SMException if stdin is not a TTY. Carved out so tests can patch the check."""
+    if not sys_stdin.isatty():
+        raise SMException("sm read requires a TTY")
+
+
+def _read_key():
+    """Read a single keypress in raw mode. Returns a single-char string. Special keys:
+    '\\n' or '\\r' = Enter, '\\x1b' = Esc, '\\x7f' = Backspace, '\\x03' = Ctrl-C.
+    Restores terminal attrs via try/finally. Tests patch this function directly."""
+    fd = sys_stdin.fileno()
+    old = tcgetattr(fd)
+    try:
+        setraw(fd)
+        return sys_stdin.read(1)
+    finally:
+        tcsetattr(fd, TCSADRAIN, old)
+
+
+def _read_line(prompt):
+    """Line-buffered prompt for find queries and save paths. One seam for tests to patch."""
+    try:
+        return input(prompt)
+    except EOFError:
+        return ""
+
+
 def _show_errors_screen(ctx, term_width):
     """Display all `ctx.errors` with full per-event detail, regardless of verbosity.
     User explicitly asked to see them by hitting [e], so verbosity gating doesn't apply."""
@@ -1235,113 +1282,213 @@ def _show_errors_screen(ctx, term_width):
             for e in events:
                 print(f"    {safe_str(e.detail, allow_newlines=False)}")
     print(f"{'═' * term_width}")
-    print("  Press Enter to return")
-    try:
-        input()
-    except EOFError:
-        pass
+    print("  Press any key to return", end="", flush=True)
+    _read_key()
+
+
+_CLEAR_SCREEN = "\x1b[H\x1b[2J"  # used only on UI exit, to hand back a clean canvas
+_HOME = "\x1b[H"  # cursor to (1,1) without clearing — per-frame, no flicker
+_EOL = "\x1b[K"  # erase from cursor to end of line — wipe leftover trailing chars
+_EOS = "\x1b[J"  # erase from cursor to end of screen — wipe rows below shorter frames
+_HIDE_CURSOR = "\x1b[?25l"
+_SHOW_CURSOR = "\x1b[?25h"
 
 
 def _read_emails_ui(account, snapshot, ctx):
     if not snapshot.messages:
         raise SMException(f"No emails found for account {account.name}. Run sync first.")
 
-    entries = [(h, e) for h, e in snapshot.messages.items() if is_live(e)]
-    entries.sort(key=lambda x: internaldate_key(x[1]), reverse=True)
-    if not entries:
+    all_entries = [(h, e) for h, e in snapshot.messages.items() if is_live(e)]
+    all_entries.sort(key=lambda x: internaldate_key(x[1]), reverse=True)
+    if not all_entries:
         raise SMException(f"No non-deleted emails found for account {account.name}.")
 
-    page_size = 20
-    page = 0
-    total_pages = (len(entries) + page_size - 1) // page_size
+    _require_tty()
+    state = ReadUIState()
 
+    print(_HIDE_CURSOR, end="")
     try:
-        term_width = os.get_terminal_size().columns
-    except (ValueError, OSError):
-        term_width = 80
+        _run_read_loop(account, snapshot, ctx, state, all_entries)
+    finally:
+        # Restore cursor + clear screen so the shell prompt comes back on a clean canvas.
+        print(_SHOW_CURSOR + _CLEAR_SCREEN, end="")
 
+
+def _run_read_loop(account, snapshot, ctx, state, all_entries):
     while True:
-        start = page * page_size
-        end = min(start + page_size, len(entries))
-        page_entries = entries[start:end]
+        try:
+            sz = os.get_terminal_size()
+            term_width = sz.columns
+            term_height = sz.lines
+        except (ValueError, OSError):
+            term_width, term_height = 80, 24
+        # 5 lines of chrome: top rule, header, top rule, bottom rule, actions.
+        # Updated each redraw so terminal resizes apply without restart, and so j/l
+        # page nav (below) uses the current page_size.
+        state.page_size = max(1, term_height - 5)
 
-        print(f"\n{'─' * term_width}")
-        print(f"  {account.name} — Page {page + 1}/{total_pages} ({len(entries)} emails)")
-        print(f"{'─' * term_width}")
+        entries = all_entries  # passes 3+5 will filter here
 
-        for i, (_content_hash, entry) in enumerate(page_entries):
+        if not entries:
+            print(f"{_HOME}  {account.name} — no matches.  [q]uit{_EOL}{_EOS}", end="", flush=True)
+            key = _read_key()
+            if key in ("q", "\x03"):
+                return
+            continue
+
+        if state.cursor < 0:
+            state.cursor = 0
+        if state.cursor >= len(entries):
+            state.cursor = len(entries) - 1
+
+        # Viewport follows cursor: only scroll the visible window when the cursor would go
+        # off-screen. Lets the user move one line at the bottom without flipping a whole page.
+        if state.cursor < state.offset:
+            state.offset = state.cursor
+        elif state.cursor >= state.offset + state.page_size:
+            state.offset = state.cursor - state.page_size + 1
+        state.offset = max(0, min(state.offset, max(0, len(entries) - state.page_size)))
+        start = state.offset
+        end = min(start + state.page_size, len(entries))
+
+        # Build the whole frame in one buffer and write it in a single flush. Reduces
+        # SSH round-trips on rapid key repeat (one packet per frame instead of one per print).
+        # No screen-clear; each line ends with _EOL so leftover trailing chars from a longer
+        # previous frame on that row are wiped as we go.
+        buf = [_HOME]
+        rule = f"{'─' * term_width}{_EOL}\n"
+        buf.append(rule)
+        buf.append(
+            f"  {account.name} — entry {state.cursor + 1}/{len(entries)} "
+            f"(showing {start + 1}–{end} of {len(entries)}){_EOL}\n"
+        )
+        buf.append(rule)
+        for i, (_content_hash, entry) in enumerate(entries[start:end]):
             num = start + i + 1
             frm = safe_str(entry.get("from", "")[:30], allow_newlines=False)
             date = format_date(entry.get("date", ""))
             subj = safe_str(entry.get("subject", "(no subject)"), allow_newlines=False)
-            prefix = f"  {num:>4}  {frm:<30}  {date:<24}  "
+            marker = "▸ " if (start + i) == state.cursor else "  "
+            prefix = f"{marker}{num:>4}  {frm:<30}  {date:<24}  "
             max_subj = term_width - len(prefix) - 1
             if max_subj > 0 and len(subj) > max_subj:
                 subj = subj[: max_subj - 1] + "…"
-            print(f"{prefix}{subj}")
-
-        print(f"{'─' * term_width}")
-        actions = "  [number] read  |  [n]ext  [p]rev"
+            buf.append(f"{prefix}{subj}{_EOL}\n")
+        # Pad blank rows so the bottom chrome stays pinned to the terminal bottom.
+        # _EOL on each pad wipes any leftover content from the previous frame on that row.
+        for _ in range(state.page_size - (end - start)):
+            buf.append(f"{_EOL}\n")
+        buf.append(rule)
+        actions = "  i/k:line  I/K:±10  j/l:edge  J/L:top/bot  Enter:open  #:jump"
         if ctx.errors:
-            actions += f"  |  [e]rrors ({len(ctx.errors)})"
-        actions += "  |  [q]uit"
-        print(actions)
+            actions += f"  e:errors({len(ctx.errors)})"
+        actions += "  q:quit"
+        if state.digit_buffer:
+            actions += f"   buffer: {state.digit_buffer}"
+        # No trailing newline on the last line: leaves cursor on the bottom row instead of
+        # scrolling. _EOS wipes anything below in case a previous frame was taller.
+        buf.append(f"{actions}{_EOL}{_EOS}")
+        print("".join(buf), end="", flush=True)
 
-        try:
-            cmd = input("\n> ").strip().lower()
-        except EOFError:
-            break
-
-        if cmd == "q":
-            break
-        elif cmd == "n":
-            if page < total_pages - 1:
-                page += 1
-        elif cmd == "p":
-            if page > 0:
-                page -= 1
-        elif cmd == "e" and ctx.errors:
-            _show_errors_screen(ctx, term_width)
-        elif cmd.isdigit():
-            idx = int(cmd) - 1
-            if 0 <= idx < len(entries):
-                content_hash, entry = entries[idx]
-                loaded = _load_message_for_display(content_hash, snapshot.mails_path, ctx)
-                if loaded is None:
-                    print("  Failed to load email — recorded; press [e] to view details.")
-                    continue
-                msg, attachments = loaded
-
-                print(f"\n{'═' * term_width}")
-                print(f"  From:    {safe_str(entry.get('from', ''), allow_newlines=False)}")
-                print(f"  Date:    {format_date(entry.get('date', ''))}")
-                print(f"  Subject: {safe_str(entry.get('subject', ''), allow_newlines=False)}")
-                auth_line = _format_auth_results(parse_authentication_results(msg))
-                if auth_line:
-                    print(f"  Auth:    {auth_line}")
-                print(f"{'═' * term_width}")
-                print(safe_str(kiss_extract_text_from_msg(msg), allow_newlines=True))
-                print(f"{'═' * term_width}")
-                if attachments:
-                    print("  Attachments:")
-                    for n, (name, content) in enumerate(attachments, 1):
-                        print(f"    {n}. {safe_str(name, allow_newlines=False)} ({_human_size(len(content))})")
-                    print(f"{'═' * term_width}")
-                actions = "  [b]ack to list" + ("  [s]ave attachment" if attachments else "") + "  [q]uit"
-                print(actions)
-
-                try:
-                    cmd2 = input("\n> ").strip().lower()
-                except EOFError:
-                    break
-                if cmd2 == "q":
-                    break
-                if cmd2 == "s" and attachments:
-                    _save_attachment_action(attachments)
+        key = _read_key()
+        if key in ("q", "\x03"):
+            return
+        elif key == "i":
+            state.cursor -= 1
+            state.digit_buffer = ""
+        elif key == "k":
+            state.cursor += 1
+            state.digit_buffer = ""
+        elif key == "I":
+            state.cursor -= 10
+            state.digit_buffer = ""
+        elif key == "K":
+            state.cursor += 10
+            state.digit_buffer = ""
+        elif key == "j":
+            # First press: snap to top of current viewport. Second press at top: page up
+            # by a full viewport (cursor and offset move together). Lets one key serve both
+            # fine-grained "get to the top of what I can see" and bulk pagination.
+            if state.cursor > state.offset:
+                state.cursor = state.offset
             else:
-                print(f"  Invalid number. Enter 1-{len(entries)}")
-        else:
-            print("  Unknown command.")
+                new_offset = max(0, state.offset - state.page_size)
+                state.cursor = new_offset
+                state.offset = new_offset
+            state.digit_buffer = ""
+        elif key == "l":
+            # Mirror of j: first press snaps cursor to bottom of viewport; second press at
+            # the bottom pages down. Offset follows cursor in the redraw clamp.
+            screen_bottom = min(state.offset + state.page_size - 1, len(entries) - 1)
+            if state.cursor < screen_bottom:
+                state.cursor = screen_bottom
+            else:
+                state.cursor = min(state.cursor + state.page_size, len(entries) - 1)
+            state.digit_buffer = ""
+        elif key == "J":
+            state.cursor = 0
+            state.digit_buffer = ""
+        elif key == "L":
+            state.cursor = len(entries) - 1
+            state.digit_buffer = ""
+        elif key.isdigit():
+            state.digit_buffer += key
+        elif key == "\x1b":
+            state.digit_buffer = ""
+        elif key in ("\n", "\r"):
+            if state.digit_buffer:
+                idx = int(state.digit_buffer) - 1
+                state.digit_buffer = ""
+                if not (0 <= idx < len(entries)):
+                    continue
+                state.cursor = idx
+            content_hash, entry = entries[state.cursor]
+            if _view_email_ui(content_hash, entry, snapshot, ctx, term_width) == "quit":
+                return
+        elif key == "e" and ctx.errors:
+            _show_errors_screen(ctx, term_width)
+
+
+def _view_email_ui(content_hash, entry, snapshot, ctx, term_width):
+    """Display one email body. Returns 'back' or 'quit' to the caller."""
+    loaded = _load_message_for_display(content_hash, snapshot.mails_path, ctx)
+    if loaded is None:
+        print(_CLEAR_SCREEN, end="")
+        print("  Failed to load email — recorded; press [e] to view details.")
+        print("  Press any key to return.", end="", flush=True)
+        key = _read_key()
+        return "quit" if key in ("q", "\x03") else "back"
+    msg, attachments = loaded
+
+    while True:
+        print(_CLEAR_SCREEN, end="")
+        print(f"{'═' * term_width}")
+        print(f"  From:    {safe_str(entry.get('from', ''), allow_newlines=False)}")
+        print(f"  Date:    {format_date(entry.get('date', ''))}")
+        print(f"  Subject: {safe_str(entry.get('subject', ''), allow_newlines=False)}")
+        auth_line = _format_auth_results(parse_authentication_results(msg))
+        if auth_line:
+            print(f"  Auth:    {auth_line}")
+        print(f"{'═' * term_width}")
+        print(safe_str(kiss_extract_text_from_msg(msg), allow_newlines=True))
+        print(f"{'═' * term_width}")
+        if attachments:
+            print("  Attachments:")
+            for n, (name, content) in enumerate(attachments, 1):
+                print(f"    {n}. {safe_str(name, allow_newlines=False)} ({_human_size(len(content))})")
+            print(f"{'═' * term_width}")
+        actions = "  b back  q quit"
+        if attachments:
+            actions += "  s save attachment"
+        print(actions, end="", flush=True)
+
+        key = _read_key()
+        if key in ("q", "\x03"):
+            return "quit"
+        if key in ("b", "\x1b"):
+            return "back"
+        if key == "s" and attachments:
+            _save_attachment_action(attachments)
 
 
 def usage(wrong_config=False, wrong_command=False):

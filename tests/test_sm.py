@@ -2081,7 +2081,8 @@ class TestReadUIShowsAuthResults(unittest.TestCase):
 
         sm.argv = ["sm", "read", "account=test"]
         buf = io.StringIO()
-        with patch("builtins.input", side_effect=["1", "q"]):
+        # "1" + Enter opens entry 1; "q" in email-view quits.
+        with patch("sm._require_tty"), patch("sm._read_key", side_effect=["1", "\n", "q"]):
             with redirect_stdout(buf):
                 sm.main()
         out = buf.getvalue()
@@ -2102,11 +2103,183 @@ class TestReadUIShowsAuthResults(unittest.TestCase):
 
         sm.argv = ["sm", "read", "account=test"]
         buf = io.StringIO()
-        with patch("builtins.input", side_effect=["1", "q"]):
+        with patch("sm._require_tty"), patch("sm._read_key", side_effect=["1", "\n", "q"]):
             with redirect_stdout(buf):
                 sm.main()
         # No Authentication-Results header → no Auth: line shown.
         self.assertNotIn("Auth:", buf.getvalue())
+
+
+class TestReadUINavigation(unittest.TestCase):
+    """Coverage for primitives introduced by the raw-mode rework: cursor, digit buffer,
+    Esc semantics, and the TTY guard. Three messages so cursor/buffer have room to move.
+    Verbosity is bumped so a generic 'unknown command' path can't hide bugs silently."""
+
+    def setUp(self):
+        import json
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmppath = Path(self._tmp.name)
+        self._orig_lock = sm.LOCK_PATH
+        self._orig_config = sm.CONFIG_PATH
+        self._orig_argv = sm.argv
+        sm.LOCK_PATH = self.tmppath / "lock"
+        sm.CONFIG_PATH = self.tmppath / "config.json"
+        Store._active = False
+        config = {"accounts": [{"name": "test", "local_store_path": str(self.tmppath / "store")}]}
+        sm.CONFIG_PATH.write_text(json.dumps(config))
+
+        # Index three messages with distinguishable subjects + descending internaldates.
+        # Newest first matches the list ordering (internaldate_key reverse=True), so
+        # entry index 0 = "first" (newest), 1 = "second", 2 = "third" (oldest).
+        with Store(self.tmppath / "store") as store:
+            for i, (subj, date) in enumerate(
+                [
+                    ("first email", "10-May-2026 14:30:00 +0000"),
+                    ("second email", "09-May-2026 14:30:00 +0000"),
+                    ("third email", "08-May-2026 14:30:00 +0000"),
+                ]
+            ):
+                body = _make_eml(subj)
+                content_hash = hashlib.sha256(body + str(i).encode()).hexdigest()
+                (store.mails_path / f"{content_hash}.eml").write_bytes(body)
+                store.messages[content_hash] = {
+                    "subject": subj,
+                    "from": "sender@example.com",
+                    "date": "Thu, 8 May 2026 14:30:00 +0000",
+                    "internaldate": date,
+                    "history": [{"folder": "INBOX", "uid": i + 1}],
+                }
+            store.save()
+
+    def tearDown(self):
+        sm.LOCK_PATH = self._orig_lock
+        sm.CONFIG_PATH = self._orig_config
+        sm.argv = self._orig_argv
+        Store._active = False
+        self._tmp.cleanup()
+
+    def _run(self, keys):
+        sm.argv = ["sm", "read", "account=test"]
+        buf = io.StringIO()
+        with patch("sm._require_tty"), patch("sm._read_key", side_effect=keys):
+            with redirect_stdout(buf):
+                sm.main()
+        return buf.getvalue()
+
+    def test_cursor_down_then_enter_opens_second_entry(self):
+        # k moves the cursor; Enter opens the cursor row (no digit buffer in play).
+        out = self._run(["k", "\n", "q"])
+        self.assertIn("Subject: second email", out)
+        self.assertNotIn("Subject: first email", out.split("Subject: second")[0] + " ")
+
+    def test_digit_buffer_jumps_to_numbered_entry(self):
+        # Digits accumulate; Enter opens that 1-indexed entry directly.
+        out = self._run(["3", "\n", "q"])
+        self.assertIn("Subject: third email", out)
+
+    def test_esc_clears_digit_buffer(self):
+        # Type "9" (would be out of range and a no-op) → Esc clears → "1" + Enter opens entry 1.
+        # If Esc didn't clear, the buffer would be "91" and Enter would be a no-op (out of range),
+        # leaving us on the list view — Subject: first email would never appear.
+        out = self._run(["9", "\x1b", "1", "\n", "q"])
+        self.assertIn("Subject: first email", out)
+
+    def test_ctrl_c_quits(self):
+        # Ctrl-C arrives as \x03 in raw mode; we treat it as q.
+        # Empty stdout (no email view rendered) confirms we exited from the list.
+        out = self._run(["\x03"])
+        self.assertNotIn("Subject:", out)
+
+    def test_require_tty_raises_when_stdin_not_a_tty(self):
+        # The seam exists so tests can bypass; the real function must refuse non-TTY stdin.
+        with patch("sm.sys_stdin") as mock_stdin:
+            mock_stdin.isatty.return_value = False
+            with self.assertRaises(SMException):
+                sm._require_tty()
+
+
+class TestReadUIViewport(unittest.TestCase):
+    """Cover the viewport-follows-cursor + I/K ±10 step introduced with the offset rework.
+    Uses 30 entries (subject 'email NN', sorted newest first) so cursor index N-1 reliably
+    maps to subject 'email N' regardless of terminal height fallback."""
+
+    def setUp(self):
+        import json
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmppath = Path(self._tmp.name)
+        self._orig_lock = sm.LOCK_PATH
+        self._orig_config = sm.CONFIG_PATH
+        self._orig_argv = sm.argv
+        sm.LOCK_PATH = self.tmppath / "lock"
+        sm.CONFIG_PATH = self.tmppath / "config.json"
+        Store._active = False
+        config = {"accounts": [{"name": "test", "local_store_path": str(self.tmppath / "store")}]}
+        sm.CONFIG_PATH.write_text(json.dumps(config))
+
+        # 30 entries: subject "email 01" (newest, sorts to index 0) → "email 30" (oldest).
+        # Dates step back by 1 day so the sort is unambiguous.
+        with Store(self.tmppath / "store") as store:
+            for n in range(1, 31):
+                day = 31 - n  # 30, 29, ..., 1
+                subj = f"email {n:02d}"
+                body = _make_eml(subj)
+                content_hash = hashlib.sha256(body + subj.encode()).hexdigest()
+                (store.mails_path / f"{content_hash}.eml").write_bytes(body)
+                store.messages[content_hash] = {
+                    "subject": subj,
+                    "from": "s@example.com",
+                    "date": "Thu, 8 May 2026 14:30:00 +0000",
+                    "internaldate": f"{day:02d}-May-2026 12:00:00 +0000",
+                    "history": [{"folder": "INBOX", "uid": n}],
+                }
+            store.save()
+
+    def tearDown(self):
+        sm.LOCK_PATH = self._orig_lock
+        sm.CONFIG_PATH = self._orig_config
+        sm.argv = self._orig_argv
+        Store._active = False
+        self._tmp.cleanup()
+
+    def _run(self, keys):
+        sm.argv = ["sm", "read", "account=test"]
+        buf = io.StringIO()
+        with patch("sm._require_tty"), patch("sm._read_key", side_effect=keys):
+            with redirect_stdout(buf):
+                sm.main()
+        return buf.getvalue()
+
+    def test_K_jumps_cursor_down_10(self):
+        # Start at cursor=0; K (+10) → cursor=10; Enter opens entries[10] = "email 11".
+        out = self._run(["K", "\n", "q"])
+        self.assertIn("Subject: email 11", out)
+
+    def test_I_after_K_jumps_back_up_10(self):
+        # K K → cursor=20; I → cursor=10; Enter opens "email 11".
+        out = self._run(["K", "K", "I", "\n", "q"])
+        self.assertIn("Subject: email 11", out)
+
+    def test_K_at_bottom_clamps(self):
+        # K x 5 = cursor=50, clamped to 29. Enter opens "email 30" (the oldest, last entry).
+        out = self._run(["K", "K", "K", "K", "K", "\n", "q"])
+        self.assertIn("Subject: email 30", out)
+
+    def test_L_jumps_to_last_entry(self):
+        out = self._run(["L", "\n", "q"])
+        self.assertIn("Subject: email 30", out)
+
+    def test_J_after_L_jumps_back_to_first(self):
+        out = self._run(["L", "J", "\n", "q"])
+        self.assertIn("Subject: email 01", out)
+
+    def test_l_twice_reaches_bottom(self):
+        # Robust across page_size: first l snaps to bottom-of-screen, second l (at the
+        # screen bottom) pages down. Either page_size >= 30 (one l reaches 29 directly)
+        # or page_size < 30 (two presses reach 29 by snap + clamp).
+        out = self._run(["l", "l", "\n", "q"])
+        self.assertIn("Subject: email 30", out)
 
 
 class TestReadUIErrorRecording(unittest.TestCase):
@@ -2157,11 +2330,12 @@ class TestReadUIErrorRecording(unittest.TestCase):
             store.save()
         return content_hash
 
-    def _run_main_read(self, inputs):
-        """Run sm.main() with action=read, scripted stdin. Returns captured stdout."""
+    def _run_main_read(self, keys):
+        """Run sm.main() with action=read, scripted single-keystroke input. Returns captured stdout.
+        Each element of `keys` is a single-char string passed to one `_read_key` call."""
         sm.argv = ["sm", "read", "account=test"]
         buf = io.StringIO()
-        with patch("builtins.input", side_effect=inputs):
+        with patch("sm._require_tty"), patch("sm._read_key", side_effect=keys):
             with redirect_stdout(buf):
                 sm.main()
         return buf.getvalue()
@@ -2171,8 +2345,8 @@ class TestReadUIErrorRecording(unittest.TestCase):
         # Manual delete of the .eml: simulates a corrupted store / lost file
         (self.tmppath / "store" / "mails" / f"{content_hash}.eml").unlink()
 
-        # Sequence: try to read entry 1 → fails inline → press [e] → return → [q]uit
-        out = self._run_main_read(["1", "e", "", "q"])
+        # "1" + Enter → load fails (failure modal) → " " dismiss → "e" errors screen → " " dismiss → "q" quit.
+        out = self._run_main_read(["1", "\n", " ", "e", " ", "q"])
 
         # UI didn't crash — we got the inline failure message
         self.assertIn("Failed to load email", out)
@@ -2186,7 +2360,7 @@ class TestReadUIErrorRecording(unittest.TestCase):
         # Force the parse step to raise: this simulates a corrupt .eml that message_from_bytes
         # can't handle. (In practice message_from_bytes is very permissive, so we mock it.)
         with patch("sm.message_from_bytes", side_effect=ValueError("malformed envelope")):
-            out = self._run_main_read(["1", "e", "", "q"])
+            out = self._run_main_read(["1", "\n", " ", "e", " ", "q"])
 
         self.assertIn("Failed to load email", out)
         self.assertIn("[read_failed]", out)
@@ -2197,7 +2371,7 @@ class TestReadUIErrorRecording(unittest.TestCase):
         self._populate_one()
         # Attachment listing crashes (rare, but list_attachments walks an arbitrary tree).
         with patch("sm.list_attachments", side_effect=RuntimeError("walk blew up")):
-            out = self._run_main_read(["1", "e", "", "q"])
+            out = self._run_main_read(["1", "\n", " ", "e", " ", "q"])
 
         self.assertIn("Failed to load email", out)
         self.assertIn("[read_failed]", out)
@@ -2213,7 +2387,7 @@ class TestShowErrorsScreen(unittest.TestCase):
     def test_no_errors_says_so(self):
         ctx = Context()
         buf = io.StringIO()
-        with redirect_stdout(buf), patch("builtins.input", return_value=""):
+        with redirect_stdout(buf), patch("sm._read_key", return_value=" "):
             sm._show_errors_screen(ctx, term_width=80)
         out = buf.getvalue()
         self.assertIn("No errors recorded", out)
@@ -2224,7 +2398,7 @@ class TestShowErrorsScreen(unittest.TestCase):
         ctx.record_error("parse_list", "second detail")
         ctx.record_error("select_failed", "third detail")
         buf = io.StringIO()
-        with redirect_stdout(buf), patch("builtins.input", return_value=""):
+        with redirect_stdout(buf), patch("sm._read_key", return_value=" "):
             sm._show_errors_screen(ctx, term_width=80)
         out = buf.getvalue()
         # Group headers with proper plural/singular labels
@@ -2241,7 +2415,7 @@ class TestShowErrorsScreen(unittest.TestCase):
         ctx.record_error("aaa", "a")
         ctx.record_error("mmm", "m")
         buf = io.StringIO()
-        with redirect_stdout(buf), patch("builtins.input", return_value=""):
+        with redirect_stdout(buf), patch("sm._read_key", return_value=" "):
             sm._show_errors_screen(ctx, term_width=80)
         out = buf.getvalue()
         self.assertLess(out.index("[aaa]"), out.index("[mmm]"))
@@ -2253,7 +2427,7 @@ class TestShowErrorsScreen(unittest.TestCase):
         ctx = Context()  # default = Verbosity.ERROR (most quiet)
         ctx.record_error("parse_list", "should still be visible")
         buf = io.StringIO()
-        with redirect_stdout(buf), patch("builtins.input", return_value=""):
+        with redirect_stdout(buf), patch("sm._read_key", return_value=" "):
             sm._show_errors_screen(ctx, term_width=80)
         self.assertIn("should still be visible", buf.getvalue())
 

@@ -6,6 +6,7 @@ can `import helpers; import sm` without each repeating the path-setup boilerplat
 
 import sys
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from hashlib import sha256
 from pathlib import Path
@@ -125,10 +126,34 @@ SAMPLES = [
 ]
 
 
-def populate_store_with_samples(store):
-    """Write SAMPLES messages + per-folder UIDVALIDITY into the given Store (already entered)."""
+def numbered_samples(n, start_idx=1):
+    """Generate `n` synthetic samples for stress-testing scroll/pagination. Each one has
+    its index baked into subject/from/body and a unique internaldate (1h apart, marching
+    backward from 2025-01-01) so the list sort order is unambiguous. Compatible with the
+    SAMPLES dict shape consumed by `populate_store_with_samples`."""
+    base = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    out = []
+    for i in range(start_idx, start_idx + n):
+        dt = base - timedelta(hours=i)
+        out.append(
+            {
+                "subject": f"[{i:04d}] generated test message — index {i}",
+                "from": f"sender{i:04d}@example.com",
+                "body": f"This is generated message {i} of {n}.\nUseful for stress-testing scroll/pagination.\n",
+                "internaldate": dt.strftime("%d-%b-%Y %H:%M:%S +0000"),
+                "folders": ["INBOX"],
+            }
+        )
+    return out
+
+
+def populate_store_with_samples(store, samples=None):
+    """Write `samples` (default: SAMPLES) + per-folder UIDVALIDITY into the given Store
+    (already entered)."""
+    if samples is None:
+        samples = SAMPLES
     next_uid = {}
-    for entry in SAMPLES:
+    for entry in samples:
         raw = build_eml(
             subject=entry["subject"],
             frm=entry["from"],
@@ -187,16 +212,17 @@ def populate_ctx_with_errors(ctx, errors=None):
 
 
 @contextmanager
-def with_demo_store():
-    """Set up a tempdir, override sm.LOCK_PATH, populate a Store with SAMPLES, yield
-    (store_path, account, ctx). Caller may pre-populate ctx.errors before invoking sm
-    APIs. Tempdir is cleaned up on exit."""
+def with_demo_store(extra_numbered=0):
+    """Set up a tempdir, override sm.LOCK_PATH, populate a Store with SAMPLES (plus
+    `extra_numbered` synthetic stress-test samples appended), yield (store_path, account, ctx).
+    Caller may pre-populate ctx.errors before invoking sm APIs. Tempdir is cleaned up on exit."""
     with TemporaryDirectory(prefix="sm-demo-") as tmp:
         tmp_path = Path(tmp)
         sm.LOCK_PATH = tmp_path / ".lock"  # don't touch the real user's lock file
         store_path = tmp_path / "store"
+        samples = SAMPLES + (numbered_samples(extra_numbered) if extra_numbered > 0 else [])
         with sm.Store(store_path) as store:
-            populate_store_with_samples(store)
+            populate_store_with_samples(store, samples)
         ctx = sm.Context()
         account = sm.MailConnectionInfos(name="demo", local_store_path=str(store_path))
         yield store_path, account, ctx
