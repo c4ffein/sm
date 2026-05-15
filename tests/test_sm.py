@@ -2,6 +2,7 @@
 
 import hashlib
 import io
+import re
 import socketserver
 import ssl
 import subprocess
@@ -39,6 +40,15 @@ from sm import (
     save_attachment_bytes,
     send_email,
 )
+
+_ANSI_CSI = re.compile(r"\x1b\[[\d;?]*[a-zA-Z]")
+
+
+def _strip_ansi(s):
+    """Remove ANSI CSI escape sequences from `s`. Read-UI rendering interleaves
+    color escapes between segments; substring assertions check visible text, not
+    raw bytes, so the _run helpers strip escapes before returning the buffer."""
+    return _ANSI_CSI.sub("", s)
 
 
 class TestParam(unittest.TestCase):
@@ -2317,7 +2327,7 @@ class TestReadUINavigation(unittest.TestCase):
         with patch("sm._require_tty"), patch("sm._read_key", side_effect=keys):
             with redirect_stdout(buf):
                 sm.main()
-        return buf.getvalue()
+        return _strip_ansi(buf.getvalue())
 
     def test_cursor_down_then_enter_opens_second_entry(self):
         # k moves the cursor; Enter opens the cursor row (no digit buffer in play).
@@ -2401,7 +2411,7 @@ class TestReadUIViewport(unittest.TestCase):
         with patch("sm._require_tty"), patch("sm._read_key", side_effect=keys):
             with redirect_stdout(buf):
                 sm.main()
-        return buf.getvalue()
+        return _strip_ansi(buf.getvalue())
 
     def test_K_jumps_cursor_down_10(self):
         # Start at cursor=0; K (+10) → cursor=10; Enter opens entries[10] = "email 11".
@@ -2541,7 +2551,7 @@ class TestReadUIFolderPresets(unittest.TestCase):
         with patch("sm._require_tty"), patch("sm._read_key", side_effect=keys):
             with redirect_stdout(buf):
                 sm.main()
-        return buf.getvalue()
+        return _strip_ansi(buf.getvalue())
 
     def test_modal_shows_preset_row_with_none_named_and_custom(self):
         out = self._run(["m", "\x1b", "q"])
@@ -2813,7 +2823,7 @@ class TestReadUIFolderFilter(unittest.TestCase):
         with patch("sm._require_tty"), patch("sm._read_key", side_effect=keys):
             with redirect_stdout(buf):
                 sm.main()
-        return buf.getvalue()
+        return _strip_ansi(buf.getvalue())
 
     def test_folder_menu_lists_all_folders_from_history_including_removed(self):
         # Open menu, immediately Esc (no change), then quit. All 3 folders must appear:
@@ -2911,7 +2921,7 @@ class TestReadUIErrorRecording(unittest.TestCase):
         with patch("sm._require_tty"), patch("sm._read_key", side_effect=keys):
             with redirect_stdout(buf):
                 sm.main()
-        return buf.getvalue()
+        return _strip_ansi(buf.getvalue())
 
     def test_missing_eml_records_and_surfaces_via_errors_screen(self):
         content_hash = self._populate_one()

@@ -1346,21 +1346,23 @@ def _summarize_errors(ctx):
 
 def format_date(raw_date):
     try:
-        return parsedate_to_datetime(raw_date).strftime("%Y-%m-%d:%H-%M-%S%z")
+        return parsedate_to_datetime(raw_date).astimezone().strftime("%Y-%m-%d:%H-%M-%S")
     except Exception:
         return safe_str(raw_date or "", allow_newlines=False)
 
 
 def _date_cell(raw):
     """Render a date for the read UI list column with its color: explicit markers for
-    missing/unparseable so problems don't get swept under the rug. Returns (text, color).
+    missing/unparseable so problems don't get swept under the rug. Dates are converted
+    to the local timezone (astimezone with no arg uses the system TZ on every platform)
+    so sort order and display are both consistent with the user's clock. Returns (text, color).
       - missing/empty:  ('[EMPTY]', RED)
       - unparseable:    ('[WRONG VALUE]: <raw>', RED)
-      - parseable:      ('YYYY-MM-DD:HH-MM-SS+TZ', None — default color)"""
+      - parseable:      ('YYYY-MM-DD:HH-MM-SS', PURP)"""
     if not raw:
         return "[EMPTY]", Color.RED
     try:
-        return parsedate_to_datetime(raw).strftime("%Y-%m-%d:%H-%M-%S%z"), None
+        return parsedate_to_datetime(raw).astimezone().strftime("%Y-%m-%d:%H-%M-%S"), Color.PURP
     except Exception:
         return f"[WRONG VALUE]: {safe_str(raw, allow_newlines=False)}", Color.RED
 
@@ -2013,42 +2015,71 @@ def _render_read_ui(fb, account, ctx, state, entries, start, end):
     W, H = fb.w, fb.h
     rule = "─" * W
     fb.put(0, 0, rule)
+    # Header is segmented so account name, counts, and ranges pop in PURP against
+    # DIM chrome. Lay each segment down at a running column offset; spaces in DIM
+    # segments are invisible but keep the math obvious.
     if entries:
-        header = (
-            f"  {account.name} — entry {state.cursor + 1}/{len(entries)} "
-            f"(showing {start + 1}–{end} of {len(entries)})"
-        )
+        header_segments = [
+            ("  ", Color.DIM),
+            (account.name, Color.PURP),
+            (" — entry ", Color.DIM),
+            (str(state.cursor + 1), Color.PURP),
+            ("/", Color.DIM),
+            (str(len(entries)), Color.PURP),
+            (" (showing ", Color.DIM),
+            (f"{start + 1}–{end}", Color.PURP),
+            (" of ", Color.DIM),
+            (str(len(entries)), Color.PURP),
+            (")", Color.DIM),
+        ]
     else:
-        header = f"  {account.name} — 0 entries"
+        header_segments = [
+            ("  ", Color.DIM),
+            (account.name, Color.PURP),
+            (" — ", Color.DIM),
+            ("0", Color.PURP),
+            (" entries", Color.DIM),
+        ]
     if state.find_query and not state.find_mode:
-        header += f"   find: {state.find_query}"
+        header_segments.append(("   find: ", Color.DIM))
+        header_segments.append((state.find_query, Color.PURP))
     if state.selection_current != "[none]":
-        header += f"   filter: {state.selection_current}"
-    fb.put(1, 0, header)
+        header_segments.append(("   filter: ", Color.DIM))
+        header_segments.append((state.selection_current, Color.PURP))
+    col = 0
+    for text, seg_color in header_segments:
+        fb.put(1, col, text, color=seg_color)
+        col += sum(_cell_width(ch) for ch in text)
     fb.put(2, 0, rule)
     list_rows = max(0, H - 5)
     date_field = "date" if state.header_date else "internaldate"
-    DATE_W = 24
+    DATE_W = 19  # YYYY-MM-DD:HH-MM-SS — no TZ suffix since dates are local.
     if entries:
         for i, (_content_hash, entry) in enumerate(entries[start:end]):
             num = start + i + 1
             frm = safe_str(entry.get("from", "")[:30], allow_newlines=False)
             subj = safe_str(entry.get("subject", "(no subject)"), allow_newlines=False)
-            marker = "▸ " if (start + i) == state.cursor else "  "
+            is_selected = (start + i) == state.cursor
+            marker = "▸ " if is_selected else "  "
+            row_color = Color.GREEN if is_selected else None
             date_text, date_color = _date_cell(entry.get(date_field, ""))
             if len(date_text) > DATE_W:
                 date_text = date_text[: DATE_W - 1] + "…"
-            # Three puts per row so the date cell can carry its own color (red for
-            # missing/unparseable). Fixed column boundaries: prefix=0..40, date=40..64,
-            # subj=66..W-1; the gap cells stay as the FB's default-init spaces.
-            prefix_left = f"{marker}{num:>4}  {frm:<30}  "
-            fb.put(3 + i, 0, prefix_left)
-            fb.put(3 + i, len(prefix_left), f"{date_text:<{DATE_W}}", color=date_color)
-            subj_col = len(prefix_left) + DATE_W + 2
+            # Per-segment puts: marker + from + subject take row_color (GREEN when
+            # selected). Number column is always DIM. Date carries its own color
+            # (PURP / RED) which intentionally wins over the selection highlight so
+            # parse failures stay visible on the focused row.
+            # Fixed columns: marker=0..2, num=2..6, from=8..38, date=40..40+DATE_W,
+            # subj=42+DATE_W..W-1. Gap cells stay as the FB's default-init spaces.
+            fb.put(3 + i, 0, marker, color=row_color)
+            fb.put(3 + i, 2, f"{num:>4}", color=Color.DIM)
+            fb.put(3 + i, 8, f"{frm:<30}", color=row_color)
+            fb.put(3 + i, 40, f"{date_text:<{DATE_W}}", color=date_color)
+            subj_col = 40 + DATE_W + 2
             max_subj = W - subj_col - 1
             if max_subj > 0 and len(subj) > max_subj:
                 subj = subj[: max_subj - 1] + "…"
-            fb.put(3 + i, subj_col, subj)
+            fb.put(3 + i, subj_col, subj, color=row_color)
     else:
         hint = (
             "no email with the current filters"
