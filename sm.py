@@ -2060,26 +2060,36 @@ def _render_read_ui(fb, account, ctx, state, entries, start, end):
             frm = safe_str(entry.get("from", "")[:30], allow_newlines=False)
             subj = safe_str(entry.get("subject", "(no subject)"), allow_newlines=False)
             is_selected = (start + i) == state.cursor
-            marker = "▸ " if is_selected else "  "
-            row_color = Color.GREEN if is_selected else None
             date_text, date_color = _date_cell(entry.get(date_field, ""))
             if len(date_text) > DATE_W:
                 date_text = date_text[: DATE_W - 1] + "…"
-            # Per-segment puts: marker + from + subject take row_color (GREEN when
-            # selected). Number column is always DIM. Date carries its own color
-            # (PURP / RED) which intentionally wins over the selection highlight so
-            # parse failures stay visible on the focused row.
+            # Selected row: every cell paints GREEN (no carve-outs). Non-selected:
+            # number column is DIM, from/subject are default, date keeps its own
+            # color (PURP for ok / RED for parse errors), and a PURP date splits
+            # the middle `:` to DIM as a tiny visual breath between date and time.
             # Fixed columns: marker=0..2, num=2..6, from=8..38, date=40..40+DATE_W,
             # subj=42+DATE_W..W-1. Gap cells stay as the FB's default-init spaces.
-            fb.put(3 + i, 0, marker, color=row_color)
-            fb.put(3 + i, 2, f"{num:>4}", color=Color.DIM)
-            fb.put(3 + i, 8, f"{frm:<30}", color=row_color)
-            fb.put(3 + i, 40, f"{date_text:<{DATE_W}}", color=date_color)
             subj_col = 40 + DATE_W + 2
             max_subj = W - subj_col - 1
             if max_subj > 0 and len(subj) > max_subj:
                 subj = subj[: max_subj - 1] + "…"
-            fb.put(3 + i, subj_col, subj, color=row_color)
+            if is_selected:
+                fb.put(3 + i, 0, "  ", color=Color.GREEN)
+                fb.put(3 + i, 2, f"{num:>4}", color=Color.GREEN)
+                fb.put(3 + i, 8, f"{frm:<30}", color=Color.GREEN)
+                fb.put(3 + i, 40, f"{date_text:<{DATE_W}}", color=Color.GREEN)
+                fb.put(3 + i, subj_col, subj, color=Color.GREEN)
+            else:
+                fb.put(3 + i, 2, f"{num:>4}", color=Color.DIM)
+                fb.put(3 + i, 8, f"{frm:<30}")
+                if date_color is Color.PURP and len(date_text) == 19:
+                    # YYYY-MM-DD:HH-MM-SS — dim the single ':' separator.
+                    fb.put(3 + i, 40, date_text[:10], color=Color.PURP)
+                    fb.put(3 + i, 50, date_text[10], color=Color.DIM)
+                    fb.put(3 + i, 51, date_text[11:], color=Color.PURP)
+                else:
+                    fb.put(3 + i, 40, f"{date_text:<{DATE_W}}", color=date_color)
+                fb.put(3 + i, subj_col, subj)
     else:
         hint = (
             "no email with the current filters"
@@ -2102,7 +2112,7 @@ def _render_read_ui(fb, account, ctx, state, entries, start, end):
         bottom += "  q:quit"
         if state.digit_buffer:
             bottom += f"   buffer: {state.digit_buffer}"
-    fb.put(H - 1, 0, bottom)
+    fb.put(H - 1, 0, bottom, color=Color.DIM)
 
 
 def _run_read_loop(account, snapshot, ctx, state, all_entries):
