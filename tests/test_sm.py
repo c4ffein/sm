@@ -164,6 +164,18 @@ class TestConsumeArgs(unittest.TestCase):
         with self.assertRaises(SMException):
             consume_args(["sm", "read", "yes"])  # yes is sync-only
 
+    def test_resync_internaldate_minimal(self):
+        action, _ = consume_args(["sm", "resync-internaldate"])
+        self.assertEqual(action, {"action": "resync-internaldate", "account": None})
+
+    def test_resync_internaldate_with_account(self):
+        action, _ = consume_args(["sm", "resync-internaldate", "account=work"])
+        self.assertEqual(action["account"], "work")
+
+    def test_resync_internaldate_invalid_option(self):
+        with self.assertRaises(SMException):
+            consume_args(["sm", "resync-internaldate", "yes"])  # yes is sync-only
+
     def test_send_minimal(self):
         action, _ = consume_args(["sm", "send", "recipient=a@b.c", "subject=hi", "body=hello"])
         self.assertEqual(action["action"], "send")
@@ -411,6 +423,61 @@ class TestParseFetchResponse(unittest.TestCase):
         results, errors = sm.parse_fetch_response(data)
         self.assertEqual(results, [(5, b"foo", "01-Jan-2026 12:00:00 +0000")])
         self.assertEqual(errors, [])
+
+
+class TestParseInternaldateOnly(unittest.TestCase):
+    """`parse_internaldate_only` parses FETCH (INTERNALDATE)-only responses for resync.
+    Simpler than parse_fetch_response: no body literal, so each part is a single bytes
+    fragment. Resync uses this to backfill INTERNALDATE without paying body bandwidth."""
+
+    def test_single_message(self):
+        data = [b'1 (UID 5 INTERNALDATE "01-Jan-2026 12:00:00 +0000")']
+        results, errors = sm.parse_internaldate_only(data)
+        self.assertEqual(results, [(5, "01-Jan-2026 12:00:00 +0000")])
+        self.assertEqual(errors, [])
+
+    def test_multiple_messages(self):
+        data = [
+            b'1 (UID 5 INTERNALDATE "01-Jan-2026 12:00:00 +0000")',
+            b'2 (UID 6 INTERNALDATE "02-Feb-2026 13:00:00 +0000")',
+        ]
+        results, errors = sm.parse_internaldate_only(data)
+        self.assertEqual(
+            results,
+            [
+                (5, "01-Jan-2026 12:00:00 +0000"),
+                (6, "02-Feb-2026 13:00:00 +0000"),
+            ],
+        )
+        self.assertEqual(errors, [])
+
+    def test_part_missing_uid_is_reported(self):
+        data = [b'1 (INTERNALDATE "01-Jan-2026 12:00:00 +0000")']
+        results, errors = sm.parse_internaldate_only(data)
+        self.assertEqual(results, [])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("missing UID", errors[0])
+
+    def test_part_missing_internaldate_is_reported(self):
+        data = [b"1 (UID 5)"]
+        results, errors = sm.parse_internaldate_only(data)
+        self.assertEqual(results, [])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("missing INTERNALDATE", errors[0])
+        self.assertIn("UID 5", errors[0])
+
+    def test_terminator_paren_ignored(self):
+        # Some servers send a lone ')' as a terminator — must not be reported as malformed.
+        data = [b'1 (UID 5 INTERNALDATE "01-Jan-2026 12:00:00 +0000")', b")"]
+        results, errors = sm.parse_internaldate_only(data)
+        self.assertEqual(results, [(5, "01-Jan-2026 12:00:00 +0000")])
+        self.assertEqual(errors, [])
+
+    def test_none_part_is_reported(self):
+        data = [None, b'1 (UID 5 INTERNALDATE "01-Jan-2026 12:00:00 +0000")']
+        results, errors = sm.parse_internaldate_only(data)
+        self.assertEqual(results, [(5, "01-Jan-2026 12:00:00 +0000")])
+        self.assertEqual(len(errors), 1)
 
 
 class TestMailConnectionInfos(unittest.TestCase):

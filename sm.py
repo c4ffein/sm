@@ -282,6 +282,37 @@ def parse_fetch_response(data):
     return results, errors
 
 
+def parse_internaldate_only(data):
+    """Parse a FETCH `(INTERNALDATE)`-only response into ([(uid, internaldate), ...], [errors]).
+
+    Simpler shape than parse_fetch_response: no RFC822 body literal means no header+trailer
+    split — each response part is a single bytes/str fragment that fully describes one UID.
+    Used by `resync_emails`, where we only need INTERNALDATE and want to skip body bandwidth."""
+    results = []
+    errors = []
+    for part in data:
+        if part is None:
+            errors.append("non-bytes part in INTERNALDATE response: None")
+            continue
+        if isinstance(part, (bytes, bytearray)):
+            text = part.decode("ascii", errors="replace")
+        else:
+            text = str(part)
+        if not text.strip() or text.strip() == ")":
+            continue
+        uid_match = re.search(r"\bUID (\d+)", text)
+        if not uid_match:
+            errors.append(f"INTERNALDATE-only part missing UID: {text[:80]!r}")
+            continue
+        uid = int(uid_match.group(1))
+        internal = _extract_internaldate(text)
+        if not internal:
+            errors.append(f"INTERNALDATE-only part missing INTERNALDATE for UID {uid}: {text[:80]!r}")
+            continue
+        results.append((uid, internal))
+    return results, errors
+
+
 ALLOWED_NAME_CHARS = "qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM0123456789.-_"
 
 
@@ -973,6 +1004,112 @@ def sync_emails(account: MailConnectionInfos, ctx: Context, auto_apply=False, ma
             raise last_exc
 
 
+def resync_internaldate(account: MailConnectionInfos, ctx: Context):
+    """Backfill missing INTERNALDATE on live entries by re-fetching `(INTERNALDATE)`
+    only — no body, ~50 bytes/msg vs ~50KB/msg, so this is cheap to run regularly.
+
+    Conservative by design: only fills entries whose `internaldate` is empty. Never
+    overwrites existing values (even unparseable ones). UIDVALIDITY mismatch on a
+    folder = skip + record an error; the regular sync handles UIDVALIDITY changes,
+    so the user should run `sm sync` then `sm resync-internaldate` again. Skips gone
+    entries (all-history-removed) entirely — they aren't shown in the read UI, so
+    refetching their INTERNALDATE would be wasted work. Producer-only: appends to
+    ctx.errors; the caller renders them via _summarize_errors."""
+    with Store(account.local_store_path) as store:
+        # Group by folder so each SELECT amortizes over many fetches.
+        # is_live filter guarantees there's at least one non-removed history entry,
+        # so live[0] is always safe — no fallback or no-history edge case to handle.
+        by_folder = {}
+        for content_hash, entry in store.messages.items():
+            if not is_live(entry) or entry.get("internaldate"):
+                continue
+            live = [h for h in entry["history"] if not h.get("removed")]
+            h = live[0]
+            by_folder.setdefault(h["folder"], []).append((h["uid"], content_hash))
+        if not by_folder:
+            print(f"  {account.name}: nothing to resync (all live entries have INTERNALDATE)")
+            return
+
+        ssl_context = make_pinned_ssl_context(account.pinned_imap_certificate_sha256, cafile=account.ssl_cafile)
+        mail = IMAP4_SSL(account.imap_ssl_host, account.imap_ssl_port, ssl_context=ssl_context)
+        mail.login(account.username, account.password)
+        try:
+            total_filled = 0
+            for folder, items in by_folder.items():
+                safe_folder = safe_str(folder, allow_newlines=False)
+                # Defense in depth: also gated at parse_list_response. If we got here with
+                # an unsafe folder name, something bypassed the parser — skip.
+                if not _is_safe_folder_name(folder):
+                    ctx.record_error(
+                        "unsafe_folder_name",
+                        f"folder {folder!r} contains disallowed bytes; refusing to SELECT (resync)",
+                    )
+                    continue
+                try:
+                    status, _msgs = mail.select(f'"{folder}"')
+                    if status != "OK":
+                        ctx.record_error("select_failed", f"resync SELECT returned {status} for folder {folder!r}")
+                        continue
+                except Exception as exc:
+                    ctx.record_error(
+                        "select_error",
+                        f"resync SELECT raised {type(exc).__name__} for folder {folder!r}: {exc}",
+                    )
+                    continue
+
+                # If UIDVALIDITY changed since last sync, our cached UIDs may not point to the
+                # same messages anymore — sending a FETCH for them could backfill INTERNALDATE
+                # from a different message entirely. Skip + record; the regular sync heals it.
+                current_uidv = _read_uidvalidity(mail)
+                stored_uidv = store.folder_states.get(folder, {}).get("uidvalidity")
+                if current_uidv is not None and stored_uidv is not None and current_uidv != stored_uidv:
+                    ctx.record_error(
+                        "uidvalidity_changed",
+                        f"resync skipping folder {folder!r}: UIDVALIDITY {stored_uidv} -> "
+                        f"{current_uidv}; run sync first",
+                    )
+                    continue
+
+                uid_to_hash = dict(items)
+                uids = list(uid_to_hash.keys())
+                noun = "entry" if len(uids) == 1 else "entries"
+                print(f"  {safe_folder}: refetching INTERNALDATE for {len(uids)} {noun}")
+                done = 0
+                # Count-only batching — INTERNALDATE-only responses are tiny (~50 bytes/msg),
+                # so peak memory is a non-issue. SYNC_BATCH_SIZE keeps round-trips reasonable.
+                for i in range(0, len(uids), SYNC_BATCH_SIZE):
+                    batch = uids[i : i + SYNC_BATCH_SIZE]
+                    uid_set = ",".join(str(u) for u in batch)
+                    _result, data = mail.uid("FETCH", uid_set, "(INTERNALDATE)")
+                    parsed, parse_errors = parse_internaldate_only(data)
+                    for detail in parse_errors:
+                        ctx.record_error("resync_parse_error", f"folder {folder!r}: {detail}")
+                    got = {u for u, _ in parsed}
+                    missing = [u for u in batch if u not in got]
+                    if missing:
+                        preview = missing[:10]
+                        suffix = "..." if len(missing) > 10 else ""
+                        ctx.record_error(
+                            "resync_fetch_incomplete",
+                            f"folder {folder!r}: requested INTERNALDATE for {len(batch)} UIDs, "
+                            f"got {len(parsed)} (missing: {preview}{suffix})",
+                        )
+                    for uid, internal in parsed:
+                        ch = uid_to_hash.get(uid)
+                        if ch:
+                            store.messages[ch]["internaldate"] = internal
+                            total_filled += 1
+                    done += len(batch)
+                    print(f"\r    {done}/{len(uids)}", end="", flush=True)
+                store.save()
+                if uids:
+                    print()
+            noun = "entry" if total_filled == 1 else "entries"
+            print(f"  {account.name}: filled INTERNALDATE for {total_filled} {noun}")
+        finally:
+            mail.logout()
+
+
 def is_live(entry):
     """True iff at least one history entry is still live (not marked removed).
     Empty history is treated as gone (defensive — entries are always created with one history item)."""
@@ -1212,6 +1349,20 @@ def format_date(raw_date):
         return parsedate_to_datetime(raw_date).strftime("%Y-%m-%d:%H-%M-%S%z")
     except Exception:
         return safe_str(raw_date or "", allow_newlines=False)
+
+
+def _date_cell(raw):
+    """Render a date for the read UI list column with its color: explicit markers for
+    missing/unparseable so problems don't get swept under the rug. Returns (text, color).
+      - missing/empty:  ('[EMPTY]', RED)
+      - unparseable:    ('[WRONG VALUE]: <raw>', RED)
+      - parseable:      ('YYYY-MM-DD:HH-MM-SS+TZ', None — default color)"""
+    if not raw:
+        return "[EMPTY]", Color.RED
+    try:
+        return parsedate_to_datetime(raw).strftime("%Y-%m-%d:%H-%M-%S%z"), None
+    except Exception:
+        return f"[WRONG VALUE]: {safe_str(raw, allow_newlines=False)}", Color.RED
 
 
 _EPOCH = datetime.min.replace(tzinfo=timezone.utc)
@@ -1877,18 +2028,27 @@ def _render_read_ui(fb, account, ctx, state, entries, start, end):
     fb.put(2, 0, rule)
     list_rows = max(0, H - 5)
     date_field = "date" if state.header_date else "internaldate"
+    DATE_W = 24
     if entries:
         for i, (_content_hash, entry) in enumerate(entries[start:end]):
             num = start + i + 1
             frm = safe_str(entry.get("from", "")[:30], allow_newlines=False)
-            date = format_date(entry.get(date_field, ""))
             subj = safe_str(entry.get("subject", "(no subject)"), allow_newlines=False)
             marker = "▸ " if (start + i) == state.cursor else "  "
-            prefix = f"{marker}{num:>4}  {frm:<30}  {date:<24}  "
-            max_subj = W - len(prefix) - 1
+            date_text, date_color = _date_cell(entry.get(date_field, ""))
+            if len(date_text) > DATE_W:
+                date_text = date_text[: DATE_W - 1] + "…"
+            # Three puts per row so the date cell can carry its own color (red for
+            # missing/unparseable). Fixed column boundaries: prefix=0..40, date=40..64,
+            # subj=66..W-1; the gap cells stay as the FB's default-init spaces.
+            prefix_left = f"{marker}{num:>4}  {frm:<30}  "
+            fb.put(3 + i, 0, prefix_left)
+            fb.put(3 + i, len(prefix_left), f"{date_text:<{DATE_W}}", color=date_color)
+            subj_col = len(prefix_left) + DATE_W + 2
+            max_subj = W - subj_col - 1
             if max_subj > 0 and len(subj) > max_subj:
                 subj = subj[: max_subj - 1] + "…"
-            fb.put(3 + i, 0, f"{prefix}{subj}")
+            fb.put(3 + i, subj_col, subj)
     else:
         hint = (
             "no email with the current filters"
@@ -2129,6 +2289,7 @@ def usage(wrong_config=False, wrong_command=False):
         "- sm send recipient=a@b.com [recipient=c@d.com ...] subject=title body=something [account=name] [file=path]",
         "- sm sync [account=name] [yes] [verbose=0|1|2]      ──➤ fetch new + review deletions/moves",
         "- sm read [account=name]                             ──➤ read emails in terminal",
+        "- sm resync-internaldate [account=name]              ──➤ backfill missing INTERNALDATE (no body fetch)",
         "───────────────────────",
         "  verbose= accepts 0/1/2 or error/info/debug (applies to all commands)",
         "You need to generate an app specific password for gmail or other mail clients",
@@ -2140,7 +2301,7 @@ def usage(wrong_config=False, wrong_command=False):
 
 
 def consume_args(argv):
-    if len(argv) < 2 or argv[1] not in ["send", "sync", "read"]:
+    if len(argv) < 2 or argv[1] not in ["send", "sync", "read", "resync-internaldate"]:
         return None, Context()
     remaining = [v for v in argv[2:] if not v.startswith("verbose=")]
     verbose_args = [v for v in argv[2:] if v.startswith("verbose=")]
@@ -2164,6 +2325,12 @@ def consume_args(argv):
         if invalid:
             raise SMException(f"Invalid options for read: {'  ;  '.join(invalid)}")
         return {"action": "read", "account": account}, ctx
+    if argv[1] == "resync-internaldate":
+        account = next((v[v.index("=") + 1 :] for v in remaining if v.startswith("account=")), None)
+        invalid = [v for v in remaining if not v.startswith("account=")]
+        if invalid:
+            raise SMException(f"Invalid options for resync-internaldate: {'  ;  '.join(invalid)}")
+        return {"action": "resync-internaldate", "account": account}, ctx
     # send
     allowed_opts = ["recipient", "subject", "body", "file", "account"]
     mandatory_opts = ["subject", "body"]
@@ -2232,6 +2399,12 @@ def main():
                 sync_emails(account, ctx, auto_apply=args["auto_apply"])
         finally:
             _summarize_errors(ctx)  # cumulative across all accounts; fires on success and exception alike
+    elif args["action"] == "resync-internaldate":
+        try:
+            for account in resolve_accounts(mail_connections_infos, args["account"]):
+                resync_internaldate(account, ctx)
+        finally:
+            _summarize_errors(ctx)
     elif args["action"] == "read":
         accounts = resolve_accounts(mail_connections_infos, args["account"])
         if len(accounts) == 1:
