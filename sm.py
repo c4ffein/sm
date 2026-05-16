@@ -130,7 +130,12 @@ class Context:
 
 
 SAFE_PRINT_CHARS = set(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" " -.,;:!?/\\@#$%&*()[]{}=+_'\"<>~`^|" "\t\n\r"
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    " -.,;:!?/\\@#$%&*()[]{}=+_'\"<>~`^|"
+    "\t\n\r"
+    "àâäçéèêëîïôöùûüÿœæÀÂÄÇÉÈÊËÎÏÔÖÙÛÜŸŒÆ"
+    "«»\u2018\u2019\u201c\u201d–—…°·"
+    "€£\u00a0"
 )
 
 
