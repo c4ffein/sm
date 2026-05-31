@@ -1538,9 +1538,13 @@ def send_patch_series(account_config, recipients, patch_paths, ctx: Context, dry
         built.append((subject, message.as_bytes(policy=SMTP_POLICY)))
 
     if dry_run:
-        for subject, msg_bytes in built:
-            ctx.log(f"--- {subject}", Verbosity.INFO)
-            ctx.log(msg_bytes.decode("utf-8", "replace"), Verbosity.INFO)
+        # The dump IS the output of a dry run, so print it unconditionally rather
+        # than through ctx.log (which is gated by verbosity, default ERROR).
+        for i, (subject, msg_bytes) in enumerate(built):
+            if i:
+                print()
+            print(f"--- message {i + 1}/{len(built)}: {subject}")
+            print(msg_bytes.decode("utf-8", "replace"))
         return [b for _, b in built]
 
     try:

@@ -1553,6 +1553,21 @@ class TestSendEmailIntegration(unittest.TestCase):
         self.assertIsNone(self.fake.delivered)  # no SMTP connection happened
         self.assertEqual(len(built), 2)
 
+    def test_send_patches_dry_run_prints_at_default_verbosity(self):
+        # The dump IS the dry-run's output, so it must reach stdout even at the
+        # default ERROR verbosity (regression: it was routed through ctx.log,
+        # which is gated by verbosity, so the dry run printed nothing).
+        account = self._make_account(self.fake.port)
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            patches = self._write_patches(d)
+            with redirect_stdout(buf):
+                send_patch_series(account, ["maint@kernel.org"], patches, Context(), dry_run=True)
+        out = buf.getvalue()
+        self.assertIn("subsys: short and sweet", out)  # 1/2 subject
+        self.assertIn("Content-Transfer-Encoding: 8bit", out)
+        self.assertIn("—", out)  # em-dash from the UTF-8 patch body
+
     def test_send_patches_threading_chain(self):
         # dry_run returns the serialized messages; verify 1/2 and 2/2 thread under
         # the first message's Message-ID via In-Reply-To + References.
