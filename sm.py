@@ -20,10 +20,13 @@ from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from email import encoders, message_from_bytes
 from email.header import decode_header
+from email.message import EmailMessage
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email.utils import parsedate_to_datetime
+from email.policy import SMTP as SMTP_POLICY
+from email.policy import default as DEFAULT_POLICY
+from email.utils import make_msgid, parsedate_to_datetime
 from enum import Enum
 from hashlib import sha256
 from html import unescape
@@ -1437,6 +1440,138 @@ def send_email(account_config, recipients, subject, body, ctx: Context, attachme
             pass
 
 
+# ─── patch-series sending (git send-email-style) ───────────────────
+#
+# A git format-patch file is already an RFC822 message: an mbox "From " separator
+# line, then From:/Date:/Subject: headers, a blank line, the commit message, and
+# the diff.  To submit a kernel patch series the mail must arrive *inline* and
+# byte-exact (git am parses the raw body), as top-level text/plain — never the
+# MIMEMultipart/base64 path build_email_message uses.  Patches are often UTF-8
+# (names like François, em-dashes in comments), so we send 8bit utf-8 bytes
+# rather than us-ascii, and thread each message under the first via In-Reply-To /
+# References so a cover letter + 1/N + 2/N land as one thread.
+
+
+def parse_format_patch(raw_bytes):
+    """Parse a `git format-patch` file into (from_addr, subject, body_bytes).
+
+    Returns the patch's own From: header (so the authored identity is preserved,
+    git send-email style — not overwritten with the sending account), the
+    unfolded Subject, and the raw body (commit message + diff) with its bytes
+    preserved exactly — no re-encoding, no line rewrapping. The leading mbox
+    `From <sha> ...` line and the RFC822 headers are stripped; the body is
+    everything after the first blank line, verbatim. from_addr is None if the
+    file has no From: header."""
+    msg = message_from_bytes(raw_bytes, policy=DEFAULT_POLICY)
+    subject = msg["Subject"]
+    if subject is None:
+        raise SMException("Patch file has no Subject header — is it a git format-patch output?")
+    subject = " ".join(str(subject).split())  # unfold multi-line Subject to a single line
+    from_addr = str(msg["From"]) if msg["From"] is not None else None
+    # get_payload(decode=True) would re-interpret CTE; we want the literal bytes
+    # after the header block, so split on the first blank line ourselves.
+    sep = raw_bytes.find(b"\n\n")
+    if sep == -1:
+        raise SMException("Patch file has no body (no blank line after headers)")
+    body_bytes = raw_bytes[sep + 2 :]
+    return from_addr, subject, body_bytes
+
+
+def build_patch_message(sender, recipients, subject, body_bytes, *, message_id, in_reply_to=None, references=None):
+    """Build one inline text/plain patch mail as an EmailMessage.
+
+    body_bytes is attached verbatim as 8bit utf-8 (no base64/quoted-printable, no
+    line wrapping). Threading headers chain the series. Returns the EmailMessage;
+    serialize with .as_bytes(policy=SMTP_POLICY) for the wire (CRLF line ends).
+
+    Patch bytes must be valid UTF-8 (git format-patch output always is — commit
+    messages and diffs are UTF-8); we decode to str so the email API emits
+    Content-Type: text/plain; charset=utf-8 with 8bit CTE. The str↔utf-8 round
+    trip is the identity for valid UTF-8, so the wire body is byte-exact."""
+    try:
+        body_str = body_bytes.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise SMException(f"Patch body is not valid UTF-8 (binary patch?): {e}") from e
+    message = EmailMessage()
+    message["From"] = sender
+    message["To"] = ", ".join(recipients)
+    message["Subject"] = subject
+    message["Message-ID"] = message_id
+    if in_reply_to:
+        message["In-Reply-To"] = in_reply_to
+    if references:
+        message["References"] = references
+    message.set_content(body_str, subtype="plain", cte="8bit", charset="utf-8")
+    return message
+
+
+@raise_smexception_on_connection_error
+def send_patch_series(account_config, recipients, patch_paths, ctx: Context, dry_run=False):
+    """Send a list of git format-patch files as one threaded, inline, byte-exact mail series.
+
+    The first file's Message-ID becomes the thread root; every later mail
+    In-Reply-To/References it (the git send-email default --thread=shallow shape).
+    With dry_run=True, builds and prints the messages but opens no connection —
+    returns the list of serialized message bytes for inspection/testing."""
+    sender_email = account_config.username
+    domain = sender_email.split("@", 1)[1] if "@" in sender_email else "localhost"
+
+    built = []  # (subject, message_bytes)
+    root_id = None
+    for path in patch_paths:
+        try:
+            raw = Path(path).read_bytes()
+        except OSError as e:
+            raise SMException(f"Cannot read patch file {path}: {e}") from e
+        from_addr, subject, body_bytes = parse_format_patch(raw)
+        # Preserve the patch's authored From: (full name); fall back to the account.
+        # The SMTP envelope sender stays sender_email regardless (set at sendmail()).
+        msg_from = from_addr or sender_email
+        msg_id = make_msgid(domain=domain)
+        kwargs = {"message_id": msg_id}
+        if root_id is not None:
+            kwargs["in_reply_to"] = root_id
+            kwargs["references"] = root_id
+        message = build_patch_message(msg_from, recipients, subject, body_bytes, **kwargs)
+        if root_id is None:
+            root_id = msg_id
+        built.append((subject, message.as_bytes(policy=SMTP_POLICY)))
+
+    if dry_run:
+        for subject, msg_bytes in built:
+            ctx.log(f"--- {subject}", Verbosity.INFO)
+            ctx.log(msg_bytes.decode("utf-8", "replace"), Verbosity.INFO)
+        return [b for _, b in built]
+
+    try:
+        ssl_context = make_pinned_ssl_context(
+            account_config.pinned_smtp_certificate_sha256, cafile=account_config.ssl_cafile
+        )
+    except Exception as e:
+        raise SMException(f"Verified TLS Error: {e}") from e
+
+    server = None
+    try:
+        server = SMTP(account_config.smtp_ssl_host, account_config.smtp_ssl_port)
+        server.starttls(context=ssl_context)
+        server.login(sender_email, account_config.password)
+        for subject, msg_bytes in built:
+            server.sendmail(sender_email, recipients, msg_bytes)
+            ctx.log(f"Sent: {subject}", Verbosity.INFO)
+        ctx.log(f"Patch series sent successfully ({len(built)} message(s))!", Verbosity.INFO)
+    except SMTPAuthenticationError as exc:
+        raise SMException(f"Auth error:\n{str(exc)}") from exc
+    except Exception as exc:
+        raise SMException(f"Error sending patch series: {str(exc)}") from exc
+    finally:
+        if server is not None:
+            try:
+                server.quit()
+            except Exception:
+                pass
+    return [b for _, b in built]
+
+
 def kiss_extract_text_from_msg(msg):
     """Naive text extraction from an already-parsed email.message: prefers text/plain,
     falls back to tag-stripped HTML. HTML handling is intentionally dumb (no entity
@@ -2333,6 +2468,8 @@ def usage(wrong_config=False, wrong_command=False):
         '    "folder_presets": {"business": ["Work", "Projects"], "personal": ["INBOX"]}  (optional, for read UI)',
         "───────────────────────",
         "- sm send recipient=a@b.com [recipient=c@d.com ...] subject=title body=something [account=name] [file=path]",
+        "- sm send-patches recipient=a@b.com [recipient=...] patch=0001.patch [patch=...] [account=name] [dry-run]",
+        "    ──➤ send git format-patch files inline + threaded (kernel-style); dry-run prints, sends nothing",
         "- sm sync [account=name] [yes] [verbose=0|1|2]      ──➤ fetch new + review deletions/moves",
         "- sm read [account=name]                             ──➤ read emails in terminal",
         "- sm resync-internaldate [account=name]              ──➤ backfill missing INTERNALDATE (no body fetch)",
@@ -2347,7 +2484,7 @@ def usage(wrong_config=False, wrong_command=False):
 
 
 def consume_args(argv):
-    if len(argv) < 2 or argv[1] not in ["send", "sync", "read", "resync-internaldate"]:
+    if len(argv) < 2 or argv[1] not in ["send", "send-patches", "sync", "read", "resync-internaldate"]:
         return None, Context()
     remaining = [v for v in argv[2:] if not v.startswith("verbose=")]
     verbose_args = [v for v in argv[2:] if v.startswith("verbose=")]
@@ -2377,6 +2514,26 @@ def consume_args(argv):
         if invalid:
             raise SMException(f"Invalid options for resync-internaldate: {'  ;  '.join(invalid)}")
         return {"action": "resync-internaldate", "account": account}, ctx
+    if argv[1] == "send-patches":
+        allowed_opts = ["recipient", "patch", "account", "dry-run"]
+        invalid = [v for v in remaining if all(not v.startswith(f"{o}=") for o in allowed_opts) and v != "dry-run"]
+        if invalid:
+            raise SMException(f"Invalid options for send-patches: {'  ;  '.join(invalid)}")
+        recipients = [v[v.index("=") + 1 :] for v in remaining if v.startswith("recipient=")]
+        if not recipients:
+            raise SMException("Missing options for send-patches: recipient")
+        patches = [v[v.index("=") + 1 :] for v in remaining if v.startswith("patch=")]
+        if not patches:
+            raise SMException("Missing options for send-patches: patch")
+        account = next((v[v.index("=") + 1 :] for v in remaining if v.startswith("account=")), None)
+        dry_run = "dry-run" in remaining
+        return {
+            "action": "send-patches",
+            "recipients": recipients,
+            "patches": patches,
+            "account": account,
+            "dry_run": dry_run,
+        }, ctx
     # send
     allowed_opts = ["recipient", "subject", "body", "file", "account"]
     mandatory_opts = ["subject", "body"]
@@ -2438,6 +2595,17 @@ def main():
             args["body"],
             ctx,
             args["files"],
+        )
+    elif args["action"] == "send-patches":
+        account_name = args["account"] or config.get("default_account_for_send")
+        if not account_name:
+            raise SMException("No account specified and no default_account_for_send in config")
+        send_patch_series(
+            resolve_accounts(mail_connections_infos, account_name)[0],
+            args["recipients"],
+            args["patches"],
+            ctx,
+            dry_run=args["dry_run"],
         )
     elif args["action"] == "sync":
         try:

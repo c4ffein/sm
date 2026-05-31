@@ -25,12 +25,37 @@ sm - Simple Mail client
     "ssl_cafile": "/optional/override"  (overrides global)
 ───────────────────────
 - sm send recipient=a@b.com [recipient=c@d.com ...] subject=title body=something [account=name] [file=path]
+- sm send-patches recipient=a@b.com [recipient=...] patch=0001.patch [patch=...] [account=name] [dry-run]
+    ──➤ send git format-patch files inline + threaded (kernel-style); dry-run prints, sends nothing
 - sm sync [account=name] [yes] [verbose=0|1|2]      ──➤ fetch new + review deletions/moves
 - sm read [account=name]                            ──➤ read emails in terminal
 ───────────────────────
   verbose= accepts 0/1/2 or error/info/debug (applies to all commands)
 You need to generate an app specific password for gmail or other mail clients
 ```
+
+## Sending a patch series (kernel-style)
+
+`sm send-patches` sends `git format-patch` files the way `git send-email` does:
+inline `text/plain` (never MIME-multipart or base64), body bytes byte-exact so
+`git am` reconstructs the commit verbatim, UTF-8 over 8bit transfer encoding
+(names like François, em-dashes in comments survive), the patch's own `From:`
+preserved, and each message threaded under the first via `In-Reply-To` /
+`References` so a cover letter + 1/N + 2/N land as one thread.
+
+```sh
+# preview without sending (prints each fully-formed message):
+sm send-patches recipient=maint@kernel.org patch=0000-cover.patch \
+    patch=0001-fix.patch patch=0002-test.patch dry-run
+
+# then actually send:
+sm send-patches recipient=maint@kernel.org [recipient=reviewer@x ...] \
+    patch=0000-cover.patch patch=0001-fix.patch patch=0002-test.patch [account=name]
+```
+
+The SMTP envelope sender is always the configured account; recipients apply to
+every message in the series. This was built to send a real Linux kernel patch
+and verified by round-tripping the output back through `git am`.
 
 ## Demo
 

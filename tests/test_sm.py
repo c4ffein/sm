@@ -11,6 +11,7 @@ import threading
 import unittest
 from contextlib import redirect_stdout
 from email import message_from_bytes
+from email.header import decode_header, make_header
 from email.message import EmailMessage
 from pathlib import Path
 from unittest.mock import patch
@@ -27,6 +28,7 @@ from sm import (
     _invalidate_cache_for_folder,
     _is_safe_folder_name,
     build_email_message,
+    build_patch_message,
     consume_args,
     decode_modified_utf7,
     internaldate_key,
@@ -35,10 +37,12 @@ from sm import (
     kiss_extract_text_from_eml,
     list_attachments,
     parse_authentication_results,
+    parse_format_patch,
     parse_list_response,
     safe_str,
     save_attachment_bytes,
     send_email,
+    send_patch_series,
 )
 
 _ANSI_CSI = re.compile(r"\x1b\[[\d;?]*[a-zA-Z]")
@@ -224,6 +228,41 @@ class TestConsumeArgs(unittest.TestCase):
     def test_send_invalid_option(self):
         with self.assertRaises(SMException):
             consume_args(["sm", "send", "recipient=a@b.c", "subject=hi", "body=hello", "bogus=x"])
+
+    def test_send_patches_minimal(self):
+        action, _ = consume_args(["sm", "send-patches", "recipient=a@b.c", "patch=0001.patch"])
+        self.assertEqual(action["action"], "send-patches")
+        self.assertEqual(action["recipients"], ["a@b.c"])
+        self.assertEqual(action["patches"], ["0001.patch"])
+        self.assertIsNone(action["account"])
+        self.assertFalse(action["dry_run"])
+
+    def test_send_patches_multiple_patches_and_recipients(self):
+        action, _ = consume_args(
+            ["sm", "send-patches", "recipient=a@b.c", "recipient=d@e.f", "patch=0001.patch", "patch=0002.patch"]
+        )
+        self.assertEqual(action["recipients"], ["a@b.c", "d@e.f"])
+        self.assertEqual(action["patches"], ["0001.patch", "0002.patch"])
+
+    def test_send_patches_dry_run_flag(self):
+        action, _ = consume_args(["sm", "send-patches", "recipient=a@b.c", "patch=0001.patch", "dry-run"])
+        self.assertTrue(action["dry_run"])
+
+    def test_send_patches_with_account(self):
+        action, _ = consume_args(["sm", "send-patches", "recipient=a@b.c", "patch=p", "account=work"])
+        self.assertEqual(action["account"], "work")
+
+    def test_send_patches_missing_recipient(self):
+        with self.assertRaises(SMException):
+            consume_args(["sm", "send-patches", "patch=0001.patch"])
+
+    def test_send_patches_missing_patch(self):
+        with self.assertRaises(SMException):
+            consume_args(["sm", "send-patches", "recipient=a@b.c"])
+
+    def test_send_patches_invalid_option(self):
+        with self.assertRaises(SMException):
+            consume_args(["sm", "send-patches", "recipient=a@b.c", "patch=p", "bogus=x"])
 
 
 class TestSafeStr(unittest.TestCase):
@@ -1122,6 +1161,119 @@ class TestBuildEmailMessage(unittest.TestCase):
         self.assertIn("Error attaching file", str(cm.exception))
 
 
+# A minimal but realistic git format-patch file (ASCII), plus a UTF-8 variant.
+_PATCH_ASCII = (
+    b"From abc123 Mon Sep 17 00:00:00 2001\n"
+    b"From: Jane Doe <jane@example.com>\n"
+    b"Date: Sun, 1 Jan 2026 00:00:00 +0000\n"
+    b"Subject: [PATCH 1/2] subsys: short and sweet\n"
+    b"\n"
+    b"A commit message body.\n"
+    b"\n"
+    b"Signed-off-by: Jane Doe <jane@example.com>\n"
+    b"---\n"
+    b" file.c | 2 +-\n"
+    b" 1 file changed, 1 insertion(+), 1 deletion(-)\n"
+    b"\n"
+    b"diff --git a/file.c b/file.c\n"
+    b"index 1111111..2222222 100644\n"
+    b"--- a/file.c\n"
+    b"+++ b/file.c\n"
+    b"@@ -1 +1 @@\n"
+    b"-old line\n"
+    b"+new line\n"
+    b"-- \n"
+    b"2.47.3\n"
+)
+
+# Subject folded across two lines (git wraps long subjects); body has an em-dash → UTF-8.
+_PATCH_UTF8_FOLDED = (
+    b"From def456 Mon Sep 17 00:00:00 2001\n"
+    b"From: =?UTF-8?q?Fran=C3=A7ois?= <francois@example.com>\n"
+    b"Date: Sun, 1 Jan 2026 00:00:00 +0000\n"
+    b"Subject: [PATCH 2/2] subsys: a subject so long that git format-patch\n"
+    b" folds it onto a second line\n"
+    b"\n"
+    b"Body with an em-dash \xe2\x80\x94 and accented name Fran\xc3\xa7ois.\n"
+    b"---\n"
+    b" b.c | 1 +\n"
+    b"\n"
+    b"diff --git a/b.c b/b.c\n"
+    b"+added \xe2\x80\x94 line\n"
+)
+
+
+class TestParseFormatPatch(unittest.TestCase):
+    def test_returns_from_subject_body(self):
+        from_addr, subject, body = parse_format_patch(_PATCH_ASCII)
+        self.assertEqual(from_addr, "Jane Doe <jane@example.com>")
+        self.assertEqual(subject, "[PATCH 1/2] subsys: short and sweet")
+        self.assertTrue(body.startswith(b"A commit message body."))
+
+    def test_body_is_byte_exact(self):
+        # Everything after the first blank line, verbatim — no re-encoding/rewrapping.
+        _, _, body = parse_format_patch(_PATCH_ASCII)
+        sep = _PATCH_ASCII.find(b"\n\n")
+        self.assertEqual(body, _PATCH_ASCII[sep + 2 :])
+
+    def test_folded_subject_unfolded_to_one_line(self):
+        _, subject, _ = parse_format_patch(_PATCH_UTF8_FOLDED)
+        expected = "[PATCH 2/2] subsys: a subject so long that git format-patch folds it onto a second line"
+        self.assertEqual(subject, expected)
+
+    def test_utf8_from_decoded(self):
+        from_addr, _, _ = parse_format_patch(_PATCH_UTF8_FOLDED)
+        self.assertEqual(from_addr, "François <francois@example.com>")
+
+    def test_utf8_body_bytes_preserved(self):
+        _, _, body = parse_format_patch(_PATCH_UTF8_FOLDED)
+        self.assertIn(b"\xe2\x80\x94", body)  # em-dash survives as raw UTF-8
+
+    def test_missing_subject_raises(self):
+        with self.assertRaises(SMException):
+            parse_format_patch(b"From: x@y\n\nbody\n")
+
+    def test_missing_body_raises(self):
+        with self.assertRaises(SMException):
+            parse_format_patch(b"Subject: x\nFrom: a@b")  # no blank line
+
+
+class TestBuildPatchMessage(unittest.TestCase):
+    def test_inline_text_plain_not_multipart(self):
+        msg = build_patch_message("a@b", ["c@d"], "subj", b"body\n", message_id="<id@h>")
+        self.assertFalse(msg.is_multipart())
+        self.assertEqual(msg.get_content_type(), "text/plain")
+
+    def test_cte_is_8bit_never_base64(self):
+        msg = build_patch_message("a@b", ["c@d"], "subj", b"body\n", message_id="<id@h>")
+        self.assertEqual(msg["Content-Transfer-Encoding"], "8bit")
+
+    def test_threading_headers(self):
+        msg = build_patch_message(
+            "a@b", ["c@d"], "s", b"x\n", message_id="<2@h>", in_reply_to="<1@h>", references="<1@h>"
+        )
+        self.assertEqual(msg["Message-ID"], "<2@h>")
+        self.assertEqual(msg["In-Reply-To"], "<1@h>")
+        self.assertEqual(msg["References"], "<1@h>")
+
+    def test_root_has_no_in_reply_to(self):
+        msg = build_patch_message("a@b", ["c@d"], "s", b"x\n", message_id="<1@h>")
+        self.assertIsNone(msg["In-Reply-To"])
+        self.assertIsNone(msg["References"])
+
+    def test_utf8_body_roundtrips_byte_exact(self):
+        body = b"diff line with em-dash \xe2\x80\x94 here\n"
+        msg = build_patch_message("a@b", ["c@d"], "s", body, message_id="<1@h>")
+        wire = msg.as_bytes()
+        # the raw body bytes appear verbatim after the header/body separator
+        sep = wire.find(b"\n\n") if b"\r\n\r\n" not in wire else wire.find(b"\r\n\r\n")
+        self.assertIn(b"\xe2\x80\x94", wire[sep:])
+
+    def test_binary_body_raises(self):
+        with self.assertRaises(SMException):
+            build_patch_message("a@b", ["c@d"], "s", b"\xff\xfe not utf8", message_id="<1@h>")
+
+
 # ─── shared TLS fixture for SMTP + IMAP integration tests ─────────────────────────
 
 _test_cert_cache = None
@@ -1366,6 +1518,56 @@ class TestSendEmailIntegration(unittest.TestCase):
         account.pinned_smtp_certificate_sha256 = "0" * 64
         with self.assertRaises(SMException):
             send_email(account, ["a@b.c"], "s", "m", Context())
+
+    def _write_patches(self, d):
+        p1 = Path(d) / "0001.patch"
+        p2 = Path(d) / "0002.patch"
+        p1.write_bytes(_PATCH_ASCII)
+        p2.write_bytes(_PATCH_UTF8_FOLDED)
+        return [str(p1), str(p2)]
+
+    def test_send_patches_delivers_last_message(self):
+        # The fake server captures only the last delivered message; assert the
+        # 2/2 (UTF-8) patch arrives inline, 8bit, with its em-dash byte-intact.
+        account = self._make_account(self.fake.port)
+        with tempfile.TemporaryDirectory() as d:
+            patches = self._write_patches(d)
+            send_patch_series(account, ["maint@kernel.org"], patches, Context())
+        # Two patches → the recipient appears once per delivered message.
+        self.assertEqual(self.fake.rcpts, ["maint@kernel.org", "maint@kernel.org"])
+        delivered = message_from_bytes(self.fake.delivered)
+        self.assertFalse(delivered.is_multipart())
+        self.assertEqual(delivered.get_content_type(), "text/plain")
+        self.assertEqual(delivered["Content-Transfer-Encoding"], "8bit")
+        # Non-ASCII display name is RFC2047 encoded on the wire (headers must be
+        # ASCII — git send-email does the same); it decodes back to François.
+        from_value = str(make_header(decode_header(delivered["From"])))
+        self.assertEqual(from_value, "François <francois@example.com>")
+        self.assertIn(b"\xe2\x80\x94", self.fake.delivered)  # em-dash body on the wire, not base64
+
+    def test_send_patches_dry_run_sends_nothing(self):
+        account = self._make_account(self.fake.port)
+        with tempfile.TemporaryDirectory() as d:
+            patches = self._write_patches(d)
+            built = send_patch_series(account, ["maint@kernel.org"], patches, Context(), dry_run=True)
+        self.assertIsNone(self.fake.delivered)  # no SMTP connection happened
+        self.assertEqual(len(built), 2)
+
+    def test_send_patches_threading_chain(self):
+        # dry_run returns the serialized messages; verify 1/2 and 2/2 thread under
+        # the first message's Message-ID via In-Reply-To + References.
+        account = self._make_account(self.fake.port)
+        with tempfile.TemporaryDirectory() as d:
+            patches = self._write_patches(d)
+            built = send_patch_series(account, ["maint@kernel.org"], patches, Context(), dry_run=True)
+        m0 = message_from_bytes(built[0])
+        m1 = message_from_bytes(built[1])
+        root = m0["Message-ID"]
+        self.assertIsNotNone(root)
+        self.assertIsNone(m0["In-Reply-To"])
+        self.assertEqual(m1["In-Reply-To"], root)
+        self.assertEqual(m1["References"], root)
+        self.assertNotEqual(m0["Message-ID"], m1["Message-ID"])
 
 
 # ─── IMAP fake server + integration tests for sync_emails ───────────────────────
