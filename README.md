@@ -24,7 +24,9 @@ sm - Simple Mail client
     "local_store_path": "XX"
     "ssl_cafile": "/optional/override"  (overrides global)
 ───────────────────────
-- sm send recipient=a@b.com [recipient=c@d.com ...] subject=title body=something [account=name] [file=path]
+- sm send recipient=a@b.com [recipient=...] [cc=...] (subject=title|subject-answer=orig)
+      (body=text|body-file=path) [account=name] [file=path] [in-reply-to=<id>] [references="<id1> <id2>"]
+      ──➤ subject-answer= prepends "Re: " idempotently; body-file= reads UTF-8 from path
 - sm send-patches recipient=a@b.com [recipient=...] patch=0001.patch [patch=...] [account=name] [dry-run]
     ──➤ send git format-patch files inline + threaded (kernel-style); dry-run prints, sends nothing
 - sm sync [account=name] [yes] [verbose=0|1|2]      ──➤ fetch new + review deletions/moves
