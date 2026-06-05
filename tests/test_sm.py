@@ -229,6 +229,108 @@ class TestConsumeArgs(unittest.TestCase):
         with self.assertRaises(SMException):
             consume_args(["sm", "send", "recipient=a@b.c", "subject=hi", "body=hello", "bogus=x"])
 
+    def test_send_cc_list(self):
+        action, _ = consume_args(["sm", "send", "recipient=a@b.c", "cc=x@y.z", "cc=w@v.u", "subject=hi", "body=hello"])
+        self.assertEqual(action["cc"], ["x@y.z", "w@v.u"])
+
+    def test_send_cc_defaults_to_empty(self):
+        action, _ = consume_args(["sm", "send", "recipient=a@b.c", "subject=hi", "body=hello"])
+        self.assertEqual(action["cc"], [])
+
+    def test_send_in_reply_to(self):
+        action, _ = consume_args(
+            ["sm", "send", "recipient=a@b.c", "subject=hi", "body=hello", "in-reply-to=<id@example>"]
+        )
+        self.assertEqual(action["in_reply_to"], "<id@example>")
+
+    def test_send_references(self):
+        action, _ = consume_args(
+            ["sm", "send", "recipient=a@b.c", "subject=hi", "body=hello", "references=<a@x> <b@y>"]
+        )
+        self.assertEqual(action["references"], "<a@x> <b@y>")
+
+    def test_send_threading_defaults_to_none(self):
+        action, _ = consume_args(["sm", "send", "recipient=a@b.c", "subject=hi", "body=hello"])
+        self.assertIsNone(action["in_reply_to"])
+        self.assertIsNone(action["references"])
+
+    def test_send_in_reply_to_auto_derives_references(self):
+        action, _ = consume_args(
+            ["sm", "send", "recipient=a@b.c", "subject=hi", "body=hello", "in-reply-to=<X@example>"]
+        )
+        self.assertEqual(action["in_reply_to"], "<X@example>")
+        self.assertEqual(action["references"], "<X@example>")
+
+    def test_send_explicit_references_wins_over_auto_derive(self):
+        action, _ = consume_args(
+            [
+                "sm",
+                "send",
+                "recipient=a@b.c",
+                "subject=hi",
+                "body=hello",
+                "in-reply-to=<X@example>",
+                "references=<A@a> <X@example>",
+            ]
+        )
+        self.assertEqual(action["references"], "<A@a> <X@example>")
+
+    def test_send_references_alone_does_not_inject_in_reply_to(self):
+        action, _ = consume_args(
+            ["sm", "send", "recipient=a@b.c", "subject=hi", "body=hello", "references=<solo@example>"]
+        )
+        self.assertIsNone(action["in_reply_to"])
+        self.assertEqual(action["references"], "<solo@example>")
+
+    def test_send_subject_answer_adds_re_iff_missing(self):
+        """subject-answer prepends 'Re: ' iff the input doesn't already start with one
+        (case-insensitive, optional space after the colon). An existing prefix is preserved
+        verbatim — casing and spacing not normalized."""
+        cases = [
+            # plain subjects → "Re: " gets prepended
+            ("[PATCH 0/2] foo", "Re: [PATCH 0/2] foo"),
+            ("Reorganize the world", "Re: Reorganize the world"),  # NOT a Re: prefix; just starts with "Re"
+            ("Aw: foo", "Re: Aw: foo"),  # German prefix — we don't normalize, just add Re:
+            # already-Re: subjects → kept verbatim, no doubling
+            ("Re: [PATCH 0/2] foo", "Re: [PATCH 0/2] foo"),
+            ("RE: foo", "RE: foo"),  # uppercase
+            ("re: foo", "re: foo"),  # lowercase
+            ("rE: foo", "rE: foo"),  # mixed case
+            ("Re:foo", "Re:foo"),  # no space after colon — still recognized
+            ("Re: Re: foo", "Re: Re: foo"),  # legacy "Re: Re:" stays as-is (we don't strip extras either)
+        ]
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                action, _ = consume_args(["sm", "send", "recipient=a@b.c", f"subject-answer={raw}", "body=hello"])
+                self.assertEqual(action["subject"], expected)
+
+    def test_send_subject_xor_subject_answer(self):
+        with self.assertRaises(SMException):
+            consume_args(["sm", "send", "recipient=a@b.c", "subject=hi", "subject-answer=foo", "body=hello"])
+
+    def test_send_requires_subject_or_subject_answer(self):
+        with self.assertRaises(SMException):
+            consume_args(["sm", "send", "recipient=a@b.c", "body=hello"])
+
+    def test_send_body_file_reads_utf8(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "reply.txt"
+            p.write_text("> quoted line\n\nmy response — with em-dash\n", encoding="utf-8")
+            action, _ = consume_args(["sm", "send", "recipient=a@b.c", "subject=hi", f"body-file={p}"])
+            self.assertEqual(action["body"], "> quoted line\n\nmy response — with em-dash\n")
+
+    def test_send_body_xor_body_file(self):
+        with self.assertRaises(SMException):
+            consume_args(["sm", "send", "recipient=a@b.c", "subject=hi", "body=hi", "body-file=/tmp/x"])
+
+    def test_send_requires_body_or_body_file(self):
+        with self.assertRaises(SMException):
+            consume_args(["sm", "send", "recipient=a@b.c", "subject=hi"])
+
+    def test_send_body_file_missing_raises(self):
+        with self.assertRaises(SMException):
+            consume_args(["sm", "send", "recipient=a@b.c", "subject=hi", "body-file=/no/such/path/reply.txt"])
+
     def test_send_patches_minimal(self):
         action, _ = consume_args(["sm", "send-patches", "recipient=a@b.c", "patch=0001.patch"])
         self.assertEqual(action["action"], "send-patches")
@@ -1160,6 +1262,27 @@ class TestBuildEmailMessage(unittest.TestCase):
             build_email_message("me@x", ["a@b.c"], "s", "b", ["/no/such/file.bin"])
         self.assertIn("Error attaching file", str(cm.exception))
 
+    def test_cc_header_set_when_provided(self):
+        msg = build_email_message("me@x", ["a@b.c"], "s", "b", cc=["x@y.z", "w@v.u"])
+        self.assertEqual(msg["Cc"], "x@y.z, w@v.u")
+
+    def test_cc_header_absent_when_empty(self):
+        msg = build_email_message("me@x", ["a@b.c"], "s", "b", cc=[])
+        self.assertIsNone(msg["Cc"])
+
+    def test_in_reply_to_header_set(self):
+        msg = build_email_message("me@x", ["a@b.c"], "s", "b", in_reply_to="<orig@example>")
+        self.assertEqual(msg["In-Reply-To"], "<orig@example>")
+
+    def test_references_header_set(self):
+        msg = build_email_message("me@x", ["a@b.c"], "s", "b", references="<r1@a> <r2@b>")
+        self.assertEqual(msg["References"], "<r1@a> <r2@b>")
+
+    def test_threading_headers_absent_by_default(self):
+        msg = build_email_message("me@x", ["a@b.c"], "s", "b")
+        self.assertIsNone(msg["In-Reply-To"])
+        self.assertIsNone(msg["References"])
+
 
 # A minimal but realistic git format-patch file (ASCII), plus a UTF-8 variant.
 _PATCH_ASCII = (
@@ -1502,6 +1625,119 @@ class TestSendEmailIntegration(unittest.TestCase):
         account = self._make_account(self.fake.port)
         send_email(account, ["a@x", "b@y", "c@z"], "subj", "msg", Context())
         self.assertEqual(self.fake.rcpts, ["a@x", "b@y", "c@z"])
+
+    def test_send_cc_in_envelope_and_header(self):
+        account = self._make_account(self.fake.port)
+        send_email(account, ["to@x"], "subj", "msg", Context(), cc=["cc1@y", "cc2@z"])
+        # Envelope RCPT TO must include both To and Cc — SMTP doesn't read the headers.
+        self.assertEqual(self.fake.rcpts, ["to@x", "cc1@y", "cc2@z"])
+        delivered_msg = message_from_bytes(self.fake.delivered)
+        self.assertEqual(delivered_msg["To"], "to@x")
+        self.assertEqual(delivered_msg["Cc"], "cc1@y, cc2@z")
+
+    def test_send_threading_headers_round_trip(self):
+        account = self._make_account(self.fake.port)
+        send_email(
+            account,
+            ["to@x"],
+            "Re: foo",
+            "msg",
+            Context(),
+            in_reply_to="<orig@example>",
+            references="<r1@a> <r2@b>",
+        )
+        delivered_msg = message_from_bytes(self.fake.delivered)
+        self.assertEqual(delivered_msg["In-Reply-To"], "<orig@example>")
+        self.assertEqual(delivered_msg["References"], "<r1@a> <r2@b>")
+
+    def test_full_lkml_reply_scenario_end_to_end(self):
+        """The exact akpm-reply pipeline: argv → consume_args → send_email → SMTP wire.
+
+        Verifies every observable a kernel reviewer cares about: the envelope carries
+        everyone (To+Cc), the Subject is Re:-prefixed exactly once, the body arrives
+        UTF-8-intact with interleaved quoting preserved, and In-Reply-To/References
+        thread correctly under akpm's reply via the original cover-letter chain.
+        """
+        cover_id = "<178027099087.72481.1976843064458686851@gmail.com>"
+        akpm_id = "<20260601175549.b4a10c07dd9e3b867f66da0c@linux-foundation.org>"
+        subject_original = "[PATCH 0/2] lib: scatterlist: fix sg_split() partial-coverage geometry + add KUnit tests"
+        body_text = (
+            "On Mon, 1 Jun 2026 17:55:49 -0700 Andrew Morton wrote:\n"
+            "> Has this been observed in real life, or was the patch motivated by code review?\n"
+            "\n"
+            "Found by code review while writing the KUnit suite — not observed in the wild.\n"
+        )
+        with tempfile.TemporaryDirectory() as d:
+            body_file = Path(d) / "reply.txt"
+            body_file.write_text(body_text, encoding="utf-8")
+            argv = [
+                "sm",
+                "send",
+                "recipient=akpm@linux-foundation.org",
+                "cc=egorenar-dev@posteo.net",
+                "cc=robert.jarzmik@free.fr",
+                "cc=t-pratham@ti.com",
+                "cc=linux-kernel@vger.kernel.org",
+                f"subject-answer={subject_original}",
+                f"body-file={body_file}",
+                f"in-reply-to={akpm_id}",
+                f"references={cover_id} {akpm_id}",
+            ]
+            action, _ = consume_args(argv)
+            # The CLI layer parsed everything correctly.
+            self.assertEqual(action["subject"], f"Re: {subject_original}")
+            self.assertEqual(action["recipients"], ["akpm@linux-foundation.org"])
+            self.assertEqual(
+                action["cc"],
+                [
+                    "egorenar-dev@posteo.net",
+                    "robert.jarzmik@free.fr",
+                    "t-pratham@ti.com",
+                    "linux-kernel@vger.kernel.org",
+                ],
+            )
+            self.assertEqual(action["in_reply_to"], akpm_id)
+            self.assertEqual(action["references"], f"{cover_id} {akpm_id}")
+            self.assertEqual(action["body"], body_text)
+            # Send it through the fake TLS-pinned SMTP server.
+            account = self._make_account(self.fake.port)
+            send_email(
+                account,
+                action["recipients"],
+                action["subject"],
+                action["body"],
+                Context(),
+                cc=action["cc"] or None,
+                in_reply_to=action["in_reply_to"],
+                references=action["references"],
+            )
+        # Envelope: SMTP RCPT TO has all 5 addresses (To + 4 Cc).
+        self.assertEqual(
+            self.fake.rcpts,
+            [
+                "akpm@linux-foundation.org",
+                "egorenar-dev@posteo.net",
+                "robert.jarzmik@free.fr",
+                "t-pratham@ti.com",
+                "linux-kernel@vger.kernel.org",
+            ],
+        )
+        # Headers on the wire.
+        delivered_msg = message_from_bytes(self.fake.delivered)
+        self.assertEqual(delivered_msg["From"], "user@localhost")
+        self.assertEqual(delivered_msg["To"], "akpm@linux-foundation.org")
+        self.assertEqual(
+            delivered_msg["Cc"],
+            "egorenar-dev@posteo.net, robert.jarzmik@free.fr, t-pratham@ti.com, linux-kernel@vger.kernel.org",
+        )
+        self.assertEqual(delivered_msg["Subject"], f"Re: {subject_original}")
+        self.assertEqual(delivered_msg["In-Reply-To"], akpm_id)
+        self.assertEqual(delivered_msg["References"], f"{cover_id} {akpm_id}")
+        # Body byte-exact, including the > -quoted excerpt and the em-dash.
+        body_part = next(p for p in delivered_msg.walk() if p.get_content_type() == "text/plain")
+        self.assertEqual(body_part.get_payload(decode=True).decode("utf-8"), body_text)
+        # Subject is Re:-prefixed exactly once — no "Re: Re: ..." doubling.
+        self.assertEqual(delivered_msg["Subject"].lower().count("re:"), 1)
 
     def test_auth_failure_raises_smexception(self):
         self.fake.stop()  # restart with fail_auth
