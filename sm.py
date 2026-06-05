@@ -1388,12 +1388,20 @@ def internaldate_key(entry):
         return _EPOCH
 
 
-def build_email_message(sender, recipients, subject, body, attachment_paths=None):
+def build_email_message(
+    sender, recipients, subject, body, attachment_paths=None, cc=None, in_reply_to=None, references=None
+):
     """Build a MIMEMultipart email message. Pure function — no I/O except reading attachments."""
     message = MIMEMultipart()
     message["From"] = sender
     message["To"] = ", ".join(recipients)
+    if cc:
+        message["Cc"] = ", ".join(cc)
     message["Subject"] = subject
+    if in_reply_to:
+        message["In-Reply-To"] = in_reply_to
+    if references:
+        message["References"] = references
     message.attach(MIMEText(body, "plain"))
     if attachment_paths:
         for file_path in attachment_paths:
@@ -1411,9 +1419,28 @@ def build_email_message(sender, recipients, subject, body, attachment_paths=None
 
 
 @raise_smexception_on_connection_error
-def send_email(account_config, recipients, subject, body, ctx: Context, attachment_paths=None):
+def send_email(
+    account_config,
+    recipients,
+    subject,
+    body,
+    ctx: Context,
+    attachment_paths=None,
+    cc=None,
+    in_reply_to=None,
+    references=None,
+):
     sender_email = account_config.username
-    message = build_email_message(sender_email, recipients, subject, body, attachment_paths)
+    message = build_email_message(
+        sender_email,
+        recipients,
+        subject,
+        body,
+        attachment_paths,
+        cc=cc,
+        in_reply_to=in_reply_to,
+        references=references,
+    )
 
     try:
         ssl_context = make_pinned_ssl_context(
@@ -1422,12 +1449,13 @@ def send_email(account_config, recipients, subject, body, ctx: Context, attachme
     except Exception as e:
         raise SMException(f"Verified TLS Error: {e}") from e
 
+    envelope_recipients = list(recipients) + (list(cc) if cc else [])
     try:
         server = SMTP(account_config.smtp_ssl_host, account_config.smtp_ssl_port)
         server.starttls(context=ssl_context)
         server.login(sender_email, account_config.password)
         text = message.as_string()
-        server.sendmail(sender_email, recipients, text)
+        server.sendmail(sender_email, envelope_recipients, text)
         ctx.log("Email sent successfully!", Verbosity.INFO)
     except SMTPAuthenticationError as exc:
         raise SMException(f"Auth error:\n{str(exc)}") from exc
@@ -2471,7 +2499,9 @@ def usage(wrong_config=False, wrong_command=False):
         '    "ssl_cafile": "/optional/override"  (overrides global)',
         '    "folder_presets": {"business": ["Work", "Projects"], "personal": ["INBOX"]}  (optional, for read UI)',
         "───────────────────────",
-        "- sm send recipient=a@b.com [recipient=c@d.com ...] subject=title body=something [account=name] [file=path]",
+        "- sm send recipient=a@b.com [recipient=...] [cc=...] (subject=title|subject-answer=orig)",
+        '      (body=text|body-file=path) [account=name] [file=path] [in-reply-to=<id>] [references="<id1> <id2>"]',
+        "      ──➤ subject-answer= prepends 'Re: ' idempotently; body-file= reads UTF-8 from path",
         "- sm send-patches recipient=a@b.com [recipient=...] patch=0001.patch [patch=...] [account=name] [dry-run]",
         "    ──➤ send git format-patch files inline + threaded (kernel-style); dry-run prints, sends nothing",
         "- sm sync [account=name] [yes] [verbose=0|1|2]      ──➤ fetch new + review deletions/moves",
@@ -2539,20 +2569,59 @@ def consume_args(argv):
             "dry_run": dry_run,
         }, ctx
     # send
-    allowed_opts = ["recipient", "subject", "body", "file", "account"]
-    mandatory_opts = ["subject", "body"]
+    allowed_opts = [
+        "recipient",
+        "cc",
+        "subject",
+        "subject-answer",
+        "body",
+        "body-file",
+        "file",
+        "account",
+        "in-reply-to",
+        "references",
+    ]
     invalid_options = [v for v in remaining if all(not v.startswith(f"{o}=") for o in allowed_opts)]
     if invalid_options:
         raise SMException(f"Invalid options for send: {'  ;  '.join(invalid_options)}")
-    single_opts = ("subject=", "body=", "account=")
+    single_opts = (
+        "subject=",
+        "subject-answer=",
+        "body=",
+        "body-file=",
+        "account=",
+        "in-reply-to=",
+        "references=",
+    )
     opts = {v[: v.index("=")]: v[v.index("=") + 1 :] for v in remaining if v.startswith(single_opts)}
-    missing_options = [v for v in mandatory_opts if v not in opts]
-    if missing_options:
-        raise SMException(f"Missing options for send: {'  ;  '.join(missing_options)}")
+    if "subject" in opts and "subject-answer" in opts:
+        raise SMException("subject= and subject-answer= are mutually exclusive")
+    if "body" in opts and "body-file" in opts:
+        raise SMException("body= and body-file= are mutually exclusive")
+    if "subject" not in opts and "subject-answer" not in opts:
+        raise SMException("Missing options for send: subject or subject-answer")
+    if "body" not in opts and "body-file" not in opts:
+        raise SMException("Missing options for send: body or body-file")
+    if "subject-answer" in opts:
+        sa = opts.pop("subject-answer")
+        opts["subject"] = sa if sa.lower().startswith("re:") else f"Re: {sa}"
+    if "body-file" in opts:
+        bf = opts.pop("body-file")
+        try:
+            opts["body"] = Path(bf).read_text(encoding="utf-8")
+        except OSError as e:
+            raise SMException(f"Cannot read body-file {bf}: {e}") from e
     opts["recipients"] = [v[v.index("=") + 1 :] for v in remaining if v.startswith("recipient=")]
     if not opts["recipients"]:
         raise SMException("Missing options for send: recipient")
+    opts["cc"] = [v[v.index("=") + 1 :] for v in remaining if v.startswith("cc=")]
     opts["files"] = [v[v.index("=") + 1 :] for v in remaining if v.startswith("file=")]
+    opts["in_reply_to"] = opts.pop("in-reply-to", None)
+    # Mirror git-send-email: when in-reply-to is set but references is not, default References to
+    # the in-reply-to value (single-link chain). Explicit references= overrides.
+    if opts["in_reply_to"] and "references" not in opts:
+        opts["references"] = opts["in_reply_to"]
+    opts.setdefault("references", None)
     opts.setdefault("account", None)
     return {**opts, "action": "send"}, ctx
 
@@ -2599,6 +2668,9 @@ def main():
             args["body"],
             ctx,
             args["files"],
+            cc=args["cc"] or None,
+            in_reply_to=args["in_reply_to"],
+            references=args["references"],
         )
     elif args["action"] == "send-patches":
         account_name = args["account"] or config.get("default_account_for_send")
