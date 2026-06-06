@@ -1360,6 +1360,27 @@ class TestParseFormatPatch(unittest.TestCase):
         with self.assertRaises(SMException):
             parse_format_patch(b"Subject: x\nFrom: a@b")  # no blank line
 
+    def test_crlf_file_not_reported_as_missing_body(self):
+        # A fully CRLF-lined file separates headers from body with \r\n\r\n, which holds
+        # no \n\n — the old find(b"\n\n") wrongly raised "no body". It must get past the
+        # boundary check (and fail later on the CR guard, not the missing-body one).
+        crlf = b"From: a@b\r\nSubject: x\r\n\r\nbody line\r\n"
+        with self.assertRaisesRegex(SMException, "CR bytes"):
+            parse_format_patch(crlf)
+
+    def test_crlf_body_refused_not_silently_corrupted(self):
+        # The silent-corruption case: LF header separator (so the body is found), but a
+        # diff line whose content ends in CRLF. 8bit text/plain can't carry the CR, so
+        # we refuse rather than ship a patch that git am would apply wrong.
+        mixed = b"Subject: x\nFrom: a@b\n\n+lf line\n+crlf line\r\n"
+        with self.assertRaisesRegex(SMException, "CR bytes"):
+            parse_format_patch(mixed)
+
+    def test_lf_body_still_byte_exact_after_boundary_change(self):
+        # Guard the regex boundary didn't shift the slice for ordinary LF patches.
+        _, _, body = parse_format_patch(_PATCH_ASCII)
+        self.assertEqual(body, _PATCH_ASCII[_PATCH_ASCII.find(b"\n\n") + 2 :])
+
 
 class TestBuildPatchMessage(unittest.TestCase):
     def test_inline_text_plain_not_multipart(self):
