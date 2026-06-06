@@ -55,6 +55,18 @@ def _strip_ansi(s):
     return _ANSI_CSI.sub("", s)
 
 
+def _mute_stdout(testcase):
+    """Silence the app's own stdout chatter (sync progress lines, the box summaries,
+    dry-run patch dumps) for the duration of one test. Integration tests assert on
+    store/server state, not on this output, so it's pure runner noise. Tests that DO
+    assert on output still nest their own redirect_stdout(buf) inside this — the inner
+    redirect wins for its block, then restores to this sink. Registered via addCleanup
+    so it unwinds even if the test errors."""
+    sink = redirect_stdout(io.StringIO())
+    sink.__enter__()
+    testcase.addCleanup(sink.__exit__, None, None, None)
+
+
 class TestParam(unittest.TestCase):
     def test_default_verbosity_is_error(self):
         self.assertEqual(Param().verbosity, Verbosity.ERROR)
@@ -1606,6 +1618,7 @@ class TestSendEmailIntegration(unittest.TestCase):
         )
 
     def setUp(self):
+        _mute_stdout(self)
         self.fake = _FakeSMTPServer(self.cert_path, self.key_path)
         self.fake.start()
 
@@ -2092,6 +2105,7 @@ class TestSyncIntegration(unittest.TestCase):
 
     def setUp(self):
         # Each test gets a fresh server, fresh store, fresh lock-file location.
+        _mute_stdout(self)
         self._tmp = tempfile.TemporaryDirectory()
         self.tmppath = Path(self._tmp.name)
         self._orig_lock = sm.LOCK_PATH
@@ -3556,6 +3570,7 @@ class TestSyncEmailsIsProducerOnly(unittest.TestCase):
         cls.cert_path, cls.key_path, cls.cert_sha256, _ = cert_data
 
     def setUp(self):
+        _mute_stdout(self)
         self._tmp = tempfile.TemporaryDirectory()
         self.tmppath = Path(self._tmp.name)
         self._orig_lock = sm.LOCK_PATH
