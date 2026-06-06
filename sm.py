@@ -1497,11 +1497,25 @@ def parse_format_patch(raw_bytes):
     subject = " ".join(str(subject).split())  # unfold multi-line Subject to a single line
     from_addr = str(msg["From"]) if msg["From"] is not None else None
     # get_payload(decode=True) would re-interpret CTE; we want the literal bytes
-    # after the header block, so split on the first blank line ourselves.
-    sep = raw_bytes.find(b"\n\n")
-    if sep == -1:
+    # after the header block, so split on the first blank line ourselves. Match the
+    # RFC boundary (\r?\n\r?\n) the header parser used, not a bare b"\n\n": a CRLF
+    # file separates with \r\n\r\n, which has no \n\n in it, so find() would miss it
+    # and wrongly report "no body". re.search().end() is an offset into raw_bytes, so
+    # the slice stays byte-exact.
+    boundary = re.search(rb"\r?\n\r?\n", raw_bytes)
+    if boundary is None:
         raise SMException("Patch file has no body (no blank line after headers)")
-    body_bytes = raw_bytes[sep + 2 :]
+    body_bytes = raw_bytes[boundary.end() :]
+    # We send the body inline as 8bit text/plain. There, line endings are the transport's
+    # (CRLF on the wire) and git am un-CRLFs on receipt — so a CR byte in the body cannot
+    # survive the round trip: a "+line\r" diff hunk (a patch touching a CRLF file) would
+    # silently apply as "+line". MIME text is line-oriented; only base64 over bytes could
+    # carry it, which defeats inline/readable patches. Refuse rather than corrupt.
+    if b"\r" in body_bytes:
+        raise SMException(
+            "Patch body contains CR bytes (CRLF line endings) — sm sends inline 8bit "
+            "text/plain, which cannot transmit them faithfully. Normalize the patch to LF."
+        )
     return from_addr, subject, body_bytes
 
 
