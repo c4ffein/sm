@@ -12,9 +12,12 @@ Possible improvements (where to start if sync feels slow):
 - Other ideas: IDLE (push), COMPRESS=DEFLATE, CONDSTORE (flag changes), STATUS probe before SELECT, lazy body fetch.
 """
 
+import atexit
 import base64
 import os
 import re
+import subprocess
+import sys
 from collections import namedtuple
 from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
@@ -29,7 +32,6 @@ from email.policy import default as DEFAULT_POLICY
 from email.utils import make_msgid, parsedate_to_datetime
 from enum import Enum
 from hashlib import sha256
-from html import unescape
 from imaplib import IMAP4_SSL
 from json import JSONDecodeError, dumps, loads
 from pathlib import Path
@@ -1480,6 +1482,20 @@ def send_email(
 # References so a cover letter + 1/N + 2/N land as one thread.
 
 
+def _find_body_start(raw_bytes):
+    """Index just past the first blank line (the header/body boundary), or -1 if none.
+    A blank line is one line terminator immediately followed by another: \\n\\n, \\r\\n\\r\\n,
+    or the mixed \\r\\n\\n / \\n\\r\\n."""
+    i = raw_bytes.find(b"\n")
+    while i != -1:
+        if raw_bytes[i + 1 : i + 2] == b"\n":
+            return i + 2
+        if raw_bytes[i + 1 : i + 3] == b"\r\n":
+            return i + 3
+        i = raw_bytes.find(b"\n", i + 1)
+    return -1
+
+
 def parse_format_patch(raw_bytes):
     """Parse a `git format-patch` file into (from_addr, subject, body_bytes).
 
@@ -1496,16 +1512,14 @@ def parse_format_patch(raw_bytes):
         raise SMException("Patch file has no Subject header — is it a git format-patch output?")
     subject = " ".join(str(subject).split())  # unfold multi-line Subject to a single line
     from_addr = str(msg["From"]) if msg["From"] is not None else None
-    # get_payload(decode=True) would re-interpret CTE; we want the literal bytes
-    # after the header block, so split on the first blank line ourselves. Match the
-    # RFC boundary (\r?\n\r?\n) the header parser used, not a bare b"\n\n": a CRLF
-    # file separates with \r\n\r\n, which has no \n\n in it, so find() would miss it
-    # and wrongly report "no body". re.search().end() is an offset into raw_bytes, so
-    # the slice stays byte-exact.
-    boundary = re.search(rb"\r?\n\r?\n", raw_bytes)
-    if boundary is None:
+    # get_payload(decode=True) would re-interpret CTE; we want the literal bytes after
+    # the header block, so find the header/body boundary ourselves. Match the same blank
+    # line the header parser used, not a bare b"\n\n": a CRLF file separates with \r\n\r\n,
+    # which has no \n\n in it, so find(b"\n\n") would miss it and wrongly report "no body".
+    body_start = _find_body_start(raw_bytes)
+    if body_start == -1:
         raise SMException("Patch file has no body (no blank line after headers)")
-    body_bytes = raw_bytes[boundary.end() :]
+    body_bytes = raw_bytes[body_start:]
     # We send the body inline as 8bit text/plain. There, line endings are the transport's
     # (CRLF on the wire) and git am un-CRLFs on receipt — so a CR byte in the body cannot
     # survive the round trip: a "+line\r" diff hunk (a patch touching a CRLF file) would
@@ -1618,10 +1632,173 @@ def send_patch_series(account_config, recipients, patch_paths, ctx: Context, dry
     return [b for _, b in built]
 
 
+# Block-level / line-break tags that should become a newline in the text rendering.
+_HTML_BLOCK_TAGS = frozenset(
+    "p div br hr li tr ul ol table blockquote section article header footer h1 h2 h3 h4 h5 h6".split()
+)
+# Tags whose *contents* are not text and must be dropped entirely.
+_HTML_DROP_TAGS = frozenset("script style head title".split())
+
+
+def _collapse_blank_lines(text):
+    """rstrip each line, squeeze runs of blank lines to a single one, trim outer blanks."""
+    cleaned, blank = [], False
+    for line in text.split("\n"):
+        line = line.rstrip()
+        if line:
+            cleaned.append(line)
+            blank = False
+        elif not blank:  # keep a single blank line as a paragraph break, drop further ones
+            cleaned.append("")
+            blank = True
+    return "\n".join(cleaned).strip("\n")
+
+
+# CPU-seconds ceiling the worker puts on itself (see _build_html_worker_src). Backstops the
+# wall-clock kill in parse(): if sm is hard-killed mid-parse the orphaned worker has no parent
+# left to time it out, so the kernel SIGXCPUs it after this many CPU-seconds instead of letting
+# an O(n^2) parse grind a core for minutes. Generous vs any real email (500KB ≈ 0.15s).
+_HTML_WORKER_CPU_SECONDS = 5
+
+
+def _build_html_worker_src(cpu_seconds):
+    """Source for the html.parser worker subprocess. Built from the same tag sets as the linear
+    renderer (single source of truth) so the two stay in sync. Pure stdlib — the child imports
+    nothing from sm. Compound statements live inside this string, so ruff never lints them. The
+    worker caps its own CPU via RLIMIT_CPU, so a runaway or orphaned parse self-terminates even
+    with no parent left to kill it (no-op where `resource` is unavailable, e.g. Windows)."""
+    return (
+        "import sys\n"
+        "try:\n"
+        "    import resource\n"
+        "    resource.setrlimit(resource.RLIMIT_CPU, (" + str(cpu_seconds) + ", " + str(cpu_seconds) + "))\n"
+        "except Exception:\n"
+        "    pass\n"
+        "from html.parser import HTMLParser\n"
+        "_BLOCK = " + repr(set(_HTML_BLOCK_TAGS)) + "\n"
+        "_DROP = " + repr(set(_HTML_DROP_TAGS)) + "\n"
+        "class _W(HTMLParser):\n"
+        "    def __init__(self):\n"
+        "        super().__init__(convert_charrefs=True)\n"
+        "        self.out = []\n"
+        "        self.drop = 0\n"
+        "    def handle_starttag(self, tag, attrs):\n"
+        "        if tag in _DROP: self.drop += 1\n"
+        "        elif tag in _BLOCK: self.out.append('\\n')\n"
+        "    def handle_startendtag(self, tag, attrs):\n"
+        "        if tag in _BLOCK: self.out.append('\\n')\n"
+        "    def handle_endtag(self, tag):\n"
+        "        if tag in _DROP: self.drop = max(0, self.drop - 1)\n"
+        "        elif tag in _BLOCK: self.out.append('\\n')\n"
+        "    def handle_data(self, data):\n"
+        "        if self.drop == 0: self.out.append(data)\n"
+        "p = _W()\n"
+        "p.feed(sys.stdin.read())\n"
+        "p.close()\n"
+        "sys.stdout.write(''.join(p.out))\n"
+    )
+
+
+_HTML_WORKER_SRC = _build_html_worker_src(_HTML_WORKER_CPU_SECONDS)
+
+
+class _WarmHtmlWorker:
+    """A pre-spawned, one-shot html.parser subprocess giving real-parser fidelity (quoted
+    '>' in attributes, comments, CDATA) that the linear renderer can't. html.parser is
+    O(n^2) on adversarial input, so it runs in a *killable* process bounded by a wall-clock
+    timeout — the mitigation threads can't provide (you can't kill a thread; killing a
+    process reclaims its CPU). One worker per parse keeps that kill isolated: a hostile
+    email kills only its own worker, never stalling others. parse() returns None on
+    timeout/crash so the caller falls back to the linear renderer. A fresh spare is spawned
+    after every parse, so the ~30ms interpreter+import cost is always paid off-path."""
+
+    def __init__(self):
+        self.proc = self._spawn()
+
+    @staticmethod
+    def _spawn():
+        return subprocess.Popen(
+            [sys.executable, "-c", _HTML_WORKER_SRC],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+
+    def parse(self, html, timeout=1.0):
+        proc = self.proc
+        try:
+            out, _ = proc.communicate(html, timeout=timeout)
+            ok = proc.returncode == 0
+        except subprocess.TimeoutExpired:  # hostile parse — kill it, reclaim the CPU
+            proc.kill()
+            proc.communicate()
+            out, ok = None, False
+        except Exception:  # broken pipe, spare died while idle, etc.
+            out, ok = None, False
+        finally:
+            self.proc = self._spawn()  # re-warm for next time
+        return out if ok else None
+
+    def shutdown(self):
+        try:
+            self.proc.kill()
+            self.proc.communicate()
+        except Exception:
+            pass
+
+
+_html_worker = None  # set by prewarm_html_worker() in the read flow; None everywhere else
+
+
+def prewarm_html_worker():
+    """Spawn the warm html.parser spare (idempotent). Call when entering the read UI so the
+    first email's ~30ms interpreter+import cost is already paid. Silently no-ops if Popen
+    fails — _html_to_text then just uses the linear renderer."""
+    global _html_worker
+    if _html_worker is None:
+        try:
+            _html_worker = _WarmHtmlWorker()
+        except Exception:
+            _html_worker = None
+
+
+def shutdown_html_worker():
+    global _html_worker
+    if _html_worker is not None:
+        _html_worker.shutdown()
+        _html_worker = None
+
+
+atexit.register(shutdown_html_worker)  # never leak the resident spare, even on abrupt exit
+
+
+def _html_to_text(html):
+    """Render tag-soup HTML to plain text via the html.parser worker. Returns (text, failed).
+
+    failed=True means the worker timed out, crashed, or could not be spawned — there is no
+    in-process fallback (by design), so the caller substitutes a placeholder. failed=False
+    with empty text is a legitimately empty body — distinct from a failure, which is the whole
+    reason this returns a bool rather than a magic string. Lazy-spawns a worker if none was
+    prewarmed, so extraction works outside the read flow (e.g. kiss_extract_text_from_eml)."""
+    if _html_worker is None:
+        prewarm_html_worker()
+    if _html_worker is None:  # spawn failed: no interpreter, fork ENOMEM, RLIMIT_NPROC, sandbox...
+        return "", True
+    result = _html_worker.parse(html)
+    if result is None:  # timed out or crashed
+        return "", True
+    return _collapse_blank_lines(result), False
+
+
+_HTML_RENDER_FAILED_MSG = "(unable to render HTML body — view the raw message)"
+
+
 def kiss_extract_text_from_msg(msg):
-    """Naive text extraction from an already-parsed email.message: prefers text/plain,
-    falls back to tag-stripped HTML. HTML handling is intentionally dumb (no entity
-    decoding bugs aside, no style/script removal) — good enough until it isn't."""
+    """Naive text extraction from an already-parsed email.message: prefers text/plain, else
+    renders the HTML part via the html.parser worker. Returns _HTML_RENDER_FAILED_MSG when the
+    worker fails (timeout/crash/no-spawn) — there is no in-process fallback by design, so open
+    the raw .eml to debug a message that won't render."""
     text_parts = []
     html_parts = []
     for part in msg.walk():
@@ -1637,10 +1814,8 @@ def kiss_extract_text_from_msg(msg):
     if text_parts:
         return "\n".join(text_parts)
     if html_parts:
-        html = "\n".join(html_parts)
-        html = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
-        html = re.sub(r"<[^>]+>", "", html)
-        return unescape(html)
+        text, failed = _html_to_text("\n".join(html_parts))
+        return _HTML_RENDER_FAILED_MSG if failed else text
     return "(no text content)"
 
 
@@ -1685,7 +1860,11 @@ def _save_attachment_action(attachments):
 
 def read_emails(account: MailConnectionInfos, ctx: Context):
     snapshot = Store.load_snapshot(account.local_store_path)
-    _read_emails_ui(account, snapshot, ctx)
+    prewarm_html_worker()  # warm the html.parser spare so the first email opens without the ~30ms hit
+    try:
+        _read_emails_ui(account, snapshot, ctx)
+    finally:
+        shutdown_html_worker()
 
 
 _AUTH_RESULT_RE = re.compile(r"\b(dkim|spf|dmarc)\s*=\s*([a-zA-Z]+)", re.IGNORECASE)

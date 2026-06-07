@@ -3,11 +3,14 @@
 import hashlib
 import io
 import re
+import signal
 import socketserver
 import ssl
 import subprocess
+import sys
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import redirect_stdout
 from email import message_from_bytes
@@ -25,6 +28,7 @@ from sm import (
     SMException,
     Store,
     Verbosity,
+    _html_to_text,
     _invalidate_cache_for_folder,
     _is_safe_folder_name,
     build_email_message,
@@ -840,9 +844,14 @@ class TestInternaldateKey(unittest.TestCase):
 
 
 class TestKissExtractTextFromEml(unittest.TestCase):
+    """End-to-end 'can we actually consume an email body' coverage: text/plain preferred,
+    HTML rendered via the worker (tags stripped, entities decoded, script/style dropped,
+    real-parser fidelity), the no-content case, and the placeholder when rendering fails."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.tmppath = Path(self.tmp.name)
+        self.addCleanup(sm.shutdown_html_worker)  # HTML cases lazy-spawn a worker; reap it
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -851,6 +860,12 @@ class TestKissExtractTextFromEml(unittest.TestCase):
         path = self.tmppath / "x.eml"
         path.write_bytes(msg.as_bytes())
         return path
+
+    def _html_eml(self, html):
+        msg = EmailMessage()
+        msg["Subject"] = "hi"
+        msg.set_content(html, subtype="html")
+        return self._write_msg(msg)
 
     def test_prefer_plain_over_html(self):
         msg = EmailMessage()
@@ -861,21 +876,30 @@ class TestKissExtractTextFromEml(unittest.TestCase):
         self.assertIn("plain version", text)
         self.assertNotIn("html version", text)
 
-    def test_html_only_fallback(self):
-        msg = EmailMessage()
-        msg["Subject"] = "hi"
-        msg.set_content("<p>html only</p><br>line2", subtype="html")
-        text = kiss_extract_text_from_eml(self._write_msg(msg))
+    def test_html_tags_stripped_and_blocks_spaced(self):
+        text = kiss_extract_text_from_eml(self._html_eml("<p>html only</p><br>line2"))
         self.assertIn("html only", text)
         self.assertIn("line2", text)
         self.assertNotIn("<p>", text)
         self.assertNotIn("<br>", text)
 
-    def test_html_entity_unescaped(self):
-        msg = EmailMessage()
-        msg.set_content("<p>5 &lt; 10</p>", subtype="html")
-        text = kiss_extract_text_from_eml(self._write_msg(msg))
-        self.assertIn("5 < 10", text)
+    def test_html_entities_decoded(self):
+        text = kiss_extract_text_from_eml(self._html_eml("<p>5 &lt; 10 &amp; up</p>"))
+        self.assertIn("5 < 10 & up", text)
+
+    def test_html_script_and_style_dropped(self):
+        text = kiss_extract_text_from_eml(
+            self._html_eml("<style>.x{color:red}</style><p>visible</p><script>alert(1)</script>")
+        )
+        self.assertIn("visible", text)
+        self.assertNotIn("alert", text)
+        self.assertNotIn("color:red", text)
+
+    def test_html_real_parser_fidelity(self):
+        # A quoted '>' inside an attribute — real-world markup the old linear renderer split
+        # wrong. End-to-end proof we consume messy HTML correctly, not just clean tags.
+        text = kiss_extract_text_from_eml(self._html_eml('<a title="x>y">click</a>'))
+        self.assertEqual(text.strip(), "click")
 
     def test_no_text_content(self):
         # Hand-built RFC822 with only an octet-stream part.
@@ -888,6 +912,86 @@ class TestKissExtractTextFromEml(unittest.TestCase):
             b"\x00\x01\x02"
         )
         self.assertEqual(kiss_extract_text_from_eml(path), "(no text content)")
+
+    def test_html_render_failure_shows_placeholder(self):
+        # When the worker can't render (timeout/crash/no-spawn → failed=True), the body shows
+        # the placeholder, never silently nothing. No in-process fallback exists by design.
+        with patch.object(sm, "_html_to_text", return_value=("", True)):
+            text = kiss_extract_text_from_eml(self._html_eml("<p>whatever</p>"))
+        self.assertEqual(text, sm._HTML_RENDER_FAILED_MSG)
+
+
+class TestWarmHtmlWorker(unittest.TestCase):
+    """The html.parser worker that renders HTML email bodies: real-parser fidelity (quoted
+    '>' in attributes), DoS-bounded by a kill timeout, CPU-capped against runaway/orphaned
+    parses, lazy-spawned on demand. _html_to_text returns (text, failed); failed=True means
+    no usable render — there is no in-process fallback. Each test reaps the spare."""
+
+    def setUp(self):
+        self.addCleanup(sm.shutdown_html_worker)  # always reap the spare, even on failure
+
+    def test_worker_source_is_valid_python(self):
+        compile(sm._HTML_WORKER_SRC, "<worker>", "exec")  # must not raise
+
+    def test_renders_with_real_parser_fidelity(self):
+        # The exact case the old linear renderer got wrong; failed=False on success.
+        sm.prewarm_html_worker()
+        self.assertEqual(_html_to_text('<a title="x>y">click</a>'), ("click", False))
+
+    def test_decodes_drops_and_blocks(self):
+        sm.prewarm_html_worker()
+        self.assertEqual(_html_to_text("<style>x</style>a &amp; <b>b</b>"), ("a & b", False))
+        self.assertEqual(_html_to_text("<p>one</p><p>two</p>"), ("one\n\ntwo", False))
+
+    def test_lazy_spawns_when_no_worker(self):
+        sm.shutdown_html_worker()
+        self.assertIsNone(sm._html_worker)
+        self.assertEqual(_html_to_text("<p>hi</p>"), ("hi", False))  # must spawn one on demand
+        self.assertIsNotNone(sm._html_worker)
+
+    def test_respawns_after_each_parse(self):
+        sm.prewarm_html_worker()
+        first = sm._html_worker.proc.pid
+        _html_to_text("<p>hi</p>")  # consumes the spare; a fresh one must be warm after
+        self.assertNotEqual(sm._html_worker.proc.pid, first)
+        self.assertEqual(_html_to_text("<i>again</i>"), ("again", False))  # the new spare works
+
+    def test_failure_returns_failed_true(self):
+        sm.prewarm_html_worker()
+        sm._html_worker.parse = lambda html, timeout=1.0: None  # simulate timeout/crash
+        self.assertEqual(_html_to_text('<a title="x>y">click</a>'), ("", True))  # no fallback
+
+    def test_hostile_parse_is_killed_and_returns_none(self):
+        sm.prewarm_html_worker()
+        start = time.perf_counter()
+        result = sm._html_worker.parse("a<" * 200000, timeout=0.3)  # html.parser would take minutes
+        self.assertIsNone(result)  # killed → _html_to_text reports failed=True
+        self.assertLess(time.perf_counter() - start, 3.0)  # bounded, no hang
+
+    def test_shutdown_clears_and_kills(self):
+        sm.prewarm_html_worker()
+        proc = sm._html_worker.proc
+        self.assertIsNone(proc.poll())  # alive
+        sm.shutdown_html_worker()
+        self.assertIsNone(sm._html_worker)
+        self.assertIsNotNone(proc.wait(timeout=2))  # reaped, has an exit code
+
+    def test_runaway_worker_is_cpu_capped(self):
+        # If sm is hard-killed mid-parse, the orphaned worker has no parent to time it out — the
+        # worker's self-imposed RLIMIT_CPU is the backstop. Build a 1s-cap worker, feed it the
+        # O(n^2) poison with NO wall-clock kill, and confirm the kernel reaps it in seconds.
+        self.assertIn("RLIMIT_CPU", sm._HTML_WORKER_SRC)  # the production worker carries the cap
+        src = sm._build_html_worker_src(1)
+        start = time.perf_counter()
+        proc = subprocess.run(
+            [sys.executable, "-c", src],
+            input="a<" * 400000,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertLess(time.perf_counter() - start, 10)  # kernel-killed, didn't grind for minutes
+        self.assertIn(proc.returncode, (-signal.SIGXCPU, -signal.SIGKILL))  # died by the CPU limit
 
 
 class TestListAttachments(unittest.TestCase):
