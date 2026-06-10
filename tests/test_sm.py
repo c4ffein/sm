@@ -1399,6 +1399,20 @@ class TestBuildEmailMessage(unittest.TestCase):
         self.assertIsNone(msg["In-Reply-To"])
         self.assertIsNone(msg["References"])
 
+    def test_single_part_text_plain_when_no_attachments(self):
+        # Mailing-list friendly: a body-only mail is bare text/plain, not a
+        # one-part multipart/mixed wrapper.
+        msg = build_email_message("me@x", ["a@b.c"], "s", "b")
+        self.assertFalse(msg.is_multipart())
+        self.assertEqual(msg.get_content_type(), "text/plain")
+
+    def test_multipart_when_attachment_present(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "x.bin"
+            f.write_bytes(b"z")
+            msg = build_email_message("me@x", ["a@b.c"], "s", "b", [str(f)])
+        self.assertTrue(msg.is_multipart())
+
 
 # A minimal but realistic git format-patch file (ASCII), plus a UTF-8 variant.
 _PATCH_ASCII = (
@@ -1441,31 +1455,62 @@ _PATCH_UTF8_FOLDED = (
     b"+added \xe2\x80\x94 line\n"
 )
 
+# A series generated with `git format-patch --in-reply-to=<v1-cover@example.com>`:
+# every file carries In-Reply-To/References to the pre-existing thread (the cover's
+# References is folded across two lines, as long msgid chains are on disk).
+_PATCH_COVER_THREADED = (
+    b"From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001\n"
+    b"In-Reply-To: <v1-cover@example.com>\n"
+    b"References: <v0-rfc@example.com>\n"
+    b" <v1-cover@example.com>\n"
+    b"From: Jane Doe <jane@example.com>\n"
+    b"Date: Sun, 1 Jan 2026 00:00:00 +0000\n"
+    b"Subject: [PATCH v2 0/2] subsys: cover\n"
+    b"\n"
+    b"Cover body.\n"
+)
+
+_PATCH_THREADED_1 = (
+    b"From abc1234 Mon Sep 17 00:00:00 2001\n"
+    b"In-Reply-To: <v1-cover@example.com>\n"
+    b"References: <v1-cover@example.com>\n"
+    b"From: Jane Doe <jane@example.com>\n"
+    b"Date: Sun, 1 Jan 2026 00:00:00 +0000\n"
+    b"Subject: [PATCH v2 1/2] subsys: change\n"
+    b"\n"
+    b"Body.\n"
+    b"---\n"
+    b" file.c | 1 +\n"
+    b"\n"
+    b"diff --git a/file.c b/file.c\n"
+    b"+line\n"
+)
+
 
 class TestParseFormatPatch(unittest.TestCase):
     def test_returns_from_subject_body(self):
-        from_addr, subject, body = parse_format_patch(_PATCH_ASCII)
+        from_addr, subject, body, _, _ = parse_format_patch(_PATCH_ASCII)
         self.assertEqual(from_addr, "Jane Doe <jane@example.com>")
         self.assertEqual(subject, "[PATCH 1/2] subsys: short and sweet")
         self.assertTrue(body.startswith(b"A commit message body."))
 
     def test_body_is_byte_exact(self):
         # Everything after the first blank line, verbatim — no re-encoding/rewrapping.
-        _, _, body = parse_format_patch(_PATCH_ASCII)
+        _, _, body, _, _ = parse_format_patch(_PATCH_ASCII)
         sep = _PATCH_ASCII.find(b"\n\n")
         self.assertEqual(body, _PATCH_ASCII[sep + 2 :])
 
     def test_folded_subject_unfolded_to_one_line(self):
-        _, subject, _ = parse_format_patch(_PATCH_UTF8_FOLDED)
+        _, subject, _, _, _ = parse_format_patch(_PATCH_UTF8_FOLDED)
         expected = "[PATCH 2/2] subsys: a subject so long that git format-patch folds it onto a second line"
         self.assertEqual(subject, expected)
 
     def test_utf8_from_decoded(self):
-        from_addr, _, _ = parse_format_patch(_PATCH_UTF8_FOLDED)
+        from_addr, _, _, _, _ = parse_format_patch(_PATCH_UTF8_FOLDED)
         self.assertEqual(from_addr, "François <francois@example.com>")
 
     def test_utf8_body_bytes_preserved(self):
-        _, _, body = parse_format_patch(_PATCH_UTF8_FOLDED)
+        _, _, body, _, _ = parse_format_patch(_PATCH_UTF8_FOLDED)
         self.assertIn(b"\xe2\x80\x94", body)  # em-dash survives as raw UTF-8
 
     def test_missing_subject_raises(self):
@@ -1494,8 +1539,18 @@ class TestParseFormatPatch(unittest.TestCase):
 
     def test_lf_body_still_byte_exact_after_boundary_change(self):
         # Guard the regex boundary didn't shift the slice for ordinary LF patches.
-        _, _, body = parse_format_patch(_PATCH_ASCII)
+        _, _, body, _, _ = parse_format_patch(_PATCH_ASCII)
         self.assertEqual(body, _PATCH_ASCII[_PATCH_ASCII.find(b"\n\n") + 2 :])
+
+    def test_threading_headers_extracted_and_unfolded(self):
+        _, _, _, in_reply_to, references = parse_format_patch(_PATCH_COVER_THREADED)
+        self.assertEqual(in_reply_to, "<v1-cover@example.com>")
+        self.assertEqual(references, "<v0-rfc@example.com> <v1-cover@example.com>")
+
+    def test_threading_headers_none_when_absent(self):
+        _, _, _, in_reply_to, references = parse_format_patch(_PATCH_ASCII)
+        self.assertIsNone(in_reply_to)
+        self.assertIsNone(references)
 
 
 class TestBuildPatchMessage(unittest.TestCase):
@@ -1741,9 +1796,18 @@ class TestSendEmailIntegration(unittest.TestCase):
         self.assertEqual(delivered_msg["From"], "user@localhost")
         self.assertEqual(delivered_msg["To"], "recipient@example.com")
         self.assertEqual(delivered_msg["Subject"], "Hello")
-        # Body inside the multipart
+        # Body of the (single-part text/plain) message
         body = next(p for p in delivered_msg.walk() if p.get_content_type() == "text/plain")
         self.assertEqual(body.get_payload(decode=True).decode().strip(), "body text")
+
+    def test_from_display_name_when_sender_name_configured(self):
+        account = self._make_account(self.fake.port)
+        account.sender_name = "Jane Op"
+        send_email(account, ["a@b.c"], "s", "m", Context())
+        delivered_msg = message_from_bytes(self.fake.delivered)
+        self.assertEqual(delivered_msg["From"], "Jane Op <user@localhost>")
+        # The SMTP envelope sender stays the bare address.
+        self.assertEqual(self.fake.mail_from, "user@localhost")
 
     def test_send_with_attachment(self):
         with tempfile.TemporaryDirectory() as d:
@@ -1957,6 +2021,39 @@ class TestSendEmailIntegration(unittest.TestCase):
         self.assertEqual(m1["In-Reply-To"], root)
         self.assertEqual(m1["References"], root)
         self.assertNotEqual(m0["Message-ID"], m1["Message-ID"])
+
+    def test_send_patches_first_mail_joins_existing_thread(self):
+        # Files generated with format-patch --in-reply-to carry In-Reply-To/References;
+        # the first mail must keep them (a v2 series threads under its v1 cover), and
+        # later mails keep that chain in front of the new root in References.
+        account = self._make_account(self.fake.port)
+        with tempfile.TemporaryDirectory() as d:
+            p0 = Path(d) / "0000-cover.patch"
+            p1 = Path(d) / "0001.patch"
+            p0.write_bytes(_PATCH_COVER_THREADED)
+            p1.write_bytes(_PATCH_THREADED_1)
+            with redirect_stdout(io.StringIO()):
+                built = send_patch_series(account, ["maint@kernel.org"], [str(p0), str(p1)], Context(), dry_run=True)
+        m0, m1 = (message_from_bytes(b) for b in built)
+        root = m0["Message-ID"]
+        self.assertEqual(m0["In-Reply-To"], "<v1-cover@example.com>")
+        self.assertEqual(m0["References"], "<v0-rfc@example.com> <v1-cover@example.com>")
+        self.assertEqual(m1["In-Reply-To"], root)
+        self.assertEqual(m1["References"], f"<v1-cover@example.com> {root}")
+
+    def test_send_patches_references_defaults_to_in_reply_to(self):
+        # A file carrying only In-Reply-To gets References defaulted to it on the
+        # first mail (mirrors git send-email and the `sm send` behavior).
+        only_irt = _PATCH_COVER_THREADED.replace(b"References: <v0-rfc@example.com>\n <v1-cover@example.com>\n", b"")
+        account = self._make_account(self.fake.port)
+        with tempfile.TemporaryDirectory() as d:
+            p0 = Path(d) / "0000-cover.patch"
+            p0.write_bytes(only_irt)
+            with redirect_stdout(io.StringIO()):
+                built = send_patch_series(account, ["maint@kernel.org"], [str(p0)], Context(), dry_run=True)
+        m0 = message_from_bytes(built[0])
+        self.assertEqual(m0["In-Reply-To"], "<v1-cover@example.com>")
+        self.assertEqual(m0["References"], "<v1-cover@example.com>")
 
 
 # ─── IMAP fake server + integration tests for sync_emails ───────────────────────

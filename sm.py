@@ -29,7 +29,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.policy import SMTP as SMTP_POLICY
 from email.policy import default as DEFAULT_POLICY
-from email.utils import make_msgid, parsedate_to_datetime
+from email.utils import formataddr, make_msgid, parsedate_to_datetime
 from enum import Enum
 from hashlib import sha256
 from imaplib import IMAP4_SSL
@@ -526,6 +526,9 @@ class MailConnectionInfos:
     pinned_smtp_certificate_sha256: str = None
     username: str = None
     password: str = None
+    # Optional From: display name for outgoing mail ("Jane Doe <user@host>");
+    # bare username if unset. The SMTP envelope sender is always the bare username.
+    sender_name: str = None
     local_store_path: str = None
     ssl_cafile: str = None
     # Optional: named folder filter presets shown in the read UI's folder menu, e.g.
@@ -1393,19 +1396,12 @@ def internaldate_key(entry):
 def build_email_message(
     sender, recipients, subject, body, attachment_paths=None, cc=None, in_reply_to=None, references=None
 ):
-    """Build a MIMEMultipart email message. Pure function — no I/O except reading attachments."""
-    message = MIMEMultipart()
-    message["From"] = sender
-    message["To"] = ", ".join(recipients)
-    if cc:
-        message["Cc"] = ", ".join(cc)
-    message["Subject"] = subject
-    if in_reply_to:
-        message["In-Reply-To"] = in_reply_to
-    if references:
-        message["References"] = references
-    message.attach(MIMEText(body, "plain"))
+    """Build an email message: bare single-part text/plain when there are no attachments
+    (the shape mailing lists expect), MIMEMultipart otherwise. Pure function — no I/O
+    except reading attachments."""
     if attachment_paths:
+        message = MIMEMultipart()
+        message.attach(MIMEText(body, "plain"))
         for file_path in attachment_paths:
             try:
                 with Path(file_path).open("rb") as attachment:
@@ -1417,6 +1413,17 @@ def build_email_message(
                 message.attach(part)
             except Exception as e:
                 raise SMException(f"Error attaching file {file_path}: {str(e)}") from e
+    else:
+        message = MIMEText(body, "plain")
+    message["From"] = sender
+    message["To"] = ", ".join(recipients)
+    if cc:
+        message["Cc"] = ", ".join(cc)
+    message["Subject"] = subject
+    if in_reply_to:
+        message["In-Reply-To"] = in_reply_to
+    if references:
+        message["References"] = references
     return message
 
 
@@ -1433,8 +1440,9 @@ def send_email(
     references=None,
 ):
     sender_email = account_config.username
+    sender = formataddr((account_config.sender_name, sender_email)) if account_config.sender_name else sender_email
     message = build_email_message(
-        sender_email,
+        sender,
         recipients,
         subject,
         body,
@@ -1479,7 +1487,10 @@ def send_email(
 # MIMEMultipart/base64 path build_email_message uses.  Patches are often UTF-8
 # (names like François, em-dashes in comments), so we send 8bit utf-8 bytes
 # rather than us-ascii, and thread each message under the first via In-Reply-To /
-# References so a cover letter + 1/N + 2/N land as one thread.
+# References so a cover letter + 1/N + 2/N land as one thread.  When the files
+# themselves carry In-Reply-To / References (git format-patch --in-reply-to, e.g.
+# a v2 series threaded under its v1 cover), the first mail keeps them, attaching
+# the whole series to that existing thread.
 
 
 def _find_body_start(raw_bytes):
@@ -1497,15 +1508,17 @@ def _find_body_start(raw_bytes):
 
 
 def parse_format_patch(raw_bytes):
-    """Parse a `git format-patch` file into (from_addr, subject, body_bytes).
+    """Parse a `git format-patch` file into (from_addr, subject, body_bytes, in_reply_to, references).
 
     Returns the patch's own From: header (so the authored identity is preserved,
     git send-email style — not overwritten with the sending account), the
-    unfolded Subject, and the raw body (commit message + diff) with its bytes
-    preserved exactly — no re-encoding, no line rewrapping. The leading mbox
-    `From <sha> ...` line and the RFC822 headers are stripped; the body is
-    everything after the first blank line, verbatim. from_addr is None if the
-    file has no From: header."""
+    unfolded Subject, the raw body (commit message + diff) with its bytes
+    preserved exactly — no re-encoding, no line rewrapping — and the file's own
+    In-Reply-To / References headers (present when the series was generated with
+    `git format-patch --in-reply-to=...`), unfolded, or None when absent. The
+    leading mbox `From <sha> ...` line and the RFC822 headers are stripped; the
+    body is everything after the first blank line, verbatim. from_addr is None
+    if the file has no From: header."""
     msg = message_from_bytes(raw_bytes, policy=DEFAULT_POLICY)
     subject = msg["Subject"]
     if subject is None:
@@ -1530,7 +1543,10 @@ def parse_format_patch(raw_bytes):
             "Patch body contains CR bytes (CRLF line endings) — sm sends inline 8bit "
             "text/plain, which cannot transmit them faithfully. Normalize the patch to LF."
         )
-    return from_addr, subject, body_bytes
+    # Unfold like Subject: References routinely wraps across lines.
+    in_reply_to = " ".join(str(msg["In-Reply-To"]).split()) if msg["In-Reply-To"] is not None else None
+    references = " ".join(str(msg["References"]).split()) if msg["References"] is not None else None
+    return from_addr, subject, body_bytes, in_reply_to, references
 
 
 def build_patch_message(sender, recipients, subject, body_bytes, *, message_id, in_reply_to=None, references=None):
@@ -1565,10 +1581,14 @@ def build_patch_message(sender, recipients, subject, body_bytes, *, message_id, 
 def send_patch_series(account_config, recipients, patch_paths, ctx: Context, dry_run=False):
     """Send a list of git format-patch files as one threaded, inline, byte-exact mail series.
 
-    The first file's Message-ID becomes the thread root; every later mail
-    In-Reply-To/References it (the git send-email default --thread=shallow shape).
-    With dry_run=True, builds and prints the messages but opens no connection —
-    returns the list of serialized message bytes for inspection/testing."""
+    The first mail's (generated) Message-ID becomes the thread root; every later
+    mail In-Reply-To/References it (the git send-email default --thread=shallow
+    shape). In-Reply-To/References found in the files themselves (git format-patch
+    --in-reply-to) are honored: the first mail carries them verbatim — attaching
+    the series to that existing thread — and later mails keep that chain in front
+    of the root in References. With dry_run=True, builds and prints the messages
+    but opens no connection — returns the list of serialized message bytes for
+    inspection/testing."""
     sender_email = account_config.username
     domain = sender_email.split("@", 1)[1] if "@" in sender_email else "localhost"
 
@@ -1579,15 +1599,24 @@ def send_patch_series(account_config, recipients, patch_paths, ctx: Context, dry
             raw = Path(path).read_bytes()
         except OSError as e:
             raise SMException(f"Cannot read patch file {path}: {e}") from e
-        from_addr, subject, body_bytes = parse_format_patch(raw)
+        from_addr, subject, body_bytes, file_in_reply_to, file_references = parse_format_patch(raw)
         # Preserve the patch's authored From: (full name); fall back to the account.
         # The SMTP envelope sender stays sender_email regardless (set at sendmail()).
         msg_from = from_addr or sender_email
         msg_id = make_msgid(domain=domain)
         kwargs = {"message_id": msg_id}
-        if root_id is not None:
+        external_thread = file_references or file_in_reply_to
+        if root_id is None:
+            # First mail: honor the file's own threading headers so the series
+            # attaches to the thread format-patch --in-reply-to pointed at. Mirror
+            # git send-email: References defaults to In-Reply-To when only that is set.
+            if file_in_reply_to:
+                kwargs["in_reply_to"] = file_in_reply_to
+            if external_thread:
+                kwargs["references"] = external_thread
+        else:
             kwargs["in_reply_to"] = root_id
-            kwargs["references"] = root_id
+            kwargs["references"] = f"{external_thread} {root_id}" if external_thread else root_id
         message = build_patch_message(msg_from, recipients, subject, body_bytes, **kwargs)
         if root_id is None:
             root_id = msg_id
@@ -2684,6 +2713,7 @@ def usage(wrong_config=False, wrong_command=False):
         '    "imap_ssl_port": 993',
         '    "username": "XX"',
         '    "password": "XX"',
+        '    "sender_name": "Jane Doe"  (optional, From: display name for send)',
         '    "pinned_imap_certificate_sha256": "XX"',
         '    "smtp_ssl_host": "XX"',
         '    "smtp_ssl_port": 587',
@@ -2697,6 +2727,7 @@ def usage(wrong_config=False, wrong_command=False):
         "      ──➤ subject-answer= prepends 'Re: ' idempotently; body-file= reads UTF-8 from path",
         "- sm send-patches recipient=a@b.com [recipient=...] patch=0001.patch [patch=...] [account=name] [dry-run]",
         "    ──➤ send git format-patch files inline + threaded (kernel-style); dry-run prints, sends nothing",
+        "    ──➤ In-Reply-To/References in the first patch (format-patch --in-reply-to) join that existing thread",
         "- sm sync [account=name] [yes] [verbose=0|1|2]      ──➤ fetch new + review deletions/moves",
         "- sm read [account=name]                             ──➤ read emails in terminal",
         "- sm resync-internaldate [account=name]              ──➤ backfill missing INTERNALDATE (no body fetch)",
@@ -2704,7 +2735,7 @@ def usage(wrong_config=False, wrong_command=False):
         "  verbose= accepts 0/1/2 or error/info/debug (applies to all commands)",
         "You need to generate an app specific password for gmail or other mail clients",
     ]
-    red_indexes = (list(range(2, 18)) if wrong_config else []) + ([19] if wrong_command else [])
+    red_indexes = (list(range(2, 19)) if wrong_config else []) + ([20] if wrong_command else [])
     output_lines = [f"\033[93m{line}\033[0m" if i in red_indexes else line for i, line in enumerate(output_lines)]
     print("\n" + "\n".join(output_lines) + "\n")
     return -1
