@@ -20,7 +20,7 @@ import subprocess
 import sys
 from collections import namedtuple
 from dataclasses import dataclass, field, fields
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email import encoders, message_from_bytes
 from email.header import decode_header
 from email.message import EmailMessage
@@ -304,7 +304,7 @@ def parse_internaldate_only(data):
         if part is None:
             errors.append("non-bytes part in INTERNALDATE response: None")
             continue
-        if isinstance(part, (bytes, bytearray)):
+        if isinstance(part, bytes | bytearray):
             text = part.decode("ascii", errors="replace")
         else:
             text = str(part)
@@ -384,7 +384,7 @@ def raise_smexception_on_connection_error(func):
             raise
         except HTTPError as exc:
             raise SMException(f"HTTP Error when reaching server: {exc.code}") from exc
-        except socket_timeout as exc:
+        except TimeoutError as exc:
             raise SMException("Timed out") from exc
         except Exception as exc:
             if isinstance(getattr(exc, "reason", None), socket_timeout):
@@ -604,7 +604,7 @@ def decode_modified_utf7(b):
     """Decode RFC 3501 §5.1.3 modified UTF-7 bytes to a Python str.
     Modified base64 uses ',' in place of '/'; payload is unpadded; '&-' encodes a literal '&'.
     Falls back to ASCII-replace on malformed input rather than raising."""
-    if not isinstance(b, (bytes, bytearray)):
+    if not isinstance(b, bytes | bytearray):
         return ""
     out = []
     i, n = 0, len(b)
@@ -649,8 +649,8 @@ def parse_list_response(item, ctx=None):
       name_for_select — ASCII str safe to send back to the server (keeps modified UTF-7)
     """
     if isinstance(item, tuple):
-        raw = b"".join(p for p in item if isinstance(p, (bytes, bytearray)))
-    elif isinstance(item, (bytes, bytearray)):
+        raw = b"".join(p for p in item if isinstance(p, bytes | bytearray))
+    elif isinstance(item, bytes | bytearray):
         raw = bytes(item)
     else:
         raw = repr(item).encode("utf-8", "replace")  # preserve identity for the error event
@@ -661,7 +661,7 @@ def parse_list_response(item, ctx=None):
             ctx.record_error("parse_list", reason, raw=raw)
         return None
 
-    if not isinstance(item, (bytes, bytearray, tuple)):
+    if not isinstance(item, bytes | bytearray | tuple):
         return _fail("non-bytes/tuple input")
 
     n = len(raw)
@@ -1380,7 +1380,7 @@ def _date_cell(raw):
         return f"[WRONG VALUE]: {safe_str(raw, allow_newlines=False)}", Color.RED
 
 
-_EPOCH = datetime.min.replace(tzinfo=timezone.utc)
+_EPOCH = datetime.min.replace(tzinfo=UTC)
 
 
 def internaldate_key(entry):
@@ -1388,7 +1388,7 @@ def internaldate_key(entry):
     raw = entry.get("internaldate") or ""
     try:
         dt = parsedate_to_datetime(raw)
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
     except (TypeError, ValueError):
         return _EPOCH
 

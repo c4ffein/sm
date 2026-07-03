@@ -6,7 +6,7 @@ can `import helpers; import sm` without each repeating the path-setup boilerplat
 
 import sys
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage
 from hashlib import sha256
 from pathlib import Path
@@ -131,7 +131,7 @@ def numbered_samples(n, start_idx=1):
     its index baked into subject/from/body and a unique internaldate (1h apart, marching
     backward from 2025-01-01) so the list sort order is unambiguous. Compatible with the
     SAMPLES dict shape consumed by `populate_store_with_samples`."""
-    base = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    base = datetime(2025, 1, 1, tzinfo=UTC)
     out = []
     for i in range(start_idx, start_idx + n):
         dt = base - timedelta(hours=i)
@@ -151,7 +151,7 @@ def multi_folder_samples(folders, n_per_folder=3):
     """Generate samples scattered across the given folders, n_per_folder each, all live.
     Subject and from carry the folder name so it's obvious which row lives where while
     you drive the folder menu. Used by demo_folder_menu.py."""
-    base = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    base = datetime(2026, 5, 1, tzinfo=UTC)
     out = []
     counter = 0
     for folder in folders:
