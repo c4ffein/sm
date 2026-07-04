@@ -13,9 +13,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: curl -LsSf https://astral.sh/uv/install.sh | sh
       - run: echo "$HOME/.local/bin" >> $GITHUB_PATH
-      - run: uv venv --python 3.12
-      - run: uv pip install -r pyproject.toml --extra dev
-      - run: . .venv/bin/activate && make lint-check
+      - run: make lint-check  # pinned ruff fetched ephemerally via uvx
 
   format:
     runs-on: ubuntu-latest
@@ -23,9 +21,7 @@ jobs:
       - uses: actions/checkout@v4
       - run: curl -LsSf https://astral.sh/uv/install.sh | sh
       - run: echo "$HOME/.local/bin" >> $GITHUB_PATH
-      - run: uv venv --python 3.12
-      - run: uv pip install -r pyproject.toml --extra dev
-      - run: . .venv/bin/activate && make format-check
+      - run: make format-check  # pinned ruff fetched ephemerally via uvx
 
   test:
     runs-on: ubuntu-latest
