@@ -681,6 +681,14 @@ class TestStore(unittest.TestCase):
             self.assertTrue(sm.LOCK_PATH.exists())
         self.assertFalse(sm.LOCK_PATH.exists())
 
+    def test_store_dirs_created_private(self):
+        # index.json/state.json hold subjects, senders, message-ids — the store root must be
+        # 0700 like mails/, not umask-default. Only checked for dirs the Store itself creates.
+        with Store(self.tmppath / "store"):
+            pass
+        self.assertEqual((self.tmppath / "store").stat().st_mode & 0o777, 0o700)
+        self.assertEqual((self.tmppath / "store" / "mails").stat().st_mode & 0o777, 0o700)
+
     def test_save_roundtrips_messages(self):
         with Store(self.tmppath / "store") as store:
             store.messages["abc"] = {"subject": "test"}
@@ -962,11 +970,20 @@ class TestWarmHtmlWorker(unittest.TestCase):
         self.assertEqual(_html_to_text('<a title="x>y">click</a>'), ("", True))  # no fallback
 
     def test_hostile_parse_is_killed_and_returns_none(self):
-        sm.prewarm_html_worker()
-        start = time.perf_counter()
-        result = sm._html_worker.parse("a<" * 200000, timeout=0.3)  # html.parser would take minutes
-        self.assertIsNone(result)  # killed → _html_to_text reports failed=True
-        self.assertLess(time.perf_counter() - start, 3.0)  # bounded, no hang
+        # CPython fixed html.parser's quadratic blowup (CVE-2025-6069, mid-2025, backported to
+        # maintained 3.x), so adversarial markup no longer reliably stalls the worker. What's
+        # under test is OUR kill path, not the parser's complexity — simulate a stuck parse
+        # with a worker that sleeps instead of answering. The wall-clock kill in parse() must
+        # fire, return None, and leave a fresh (also patched, then reaped) spare behind.
+        with patch.object(sm, "_HTML_WORKER_SRC", "import time\ntime.sleep(30)\n"):
+            worker = sm._WarmHtmlWorker()
+            try:
+                start = time.perf_counter()
+                result = worker.parse("x", timeout=0.3)
+                self.assertIsNone(result)  # killed → _html_to_text reports failed=True
+                self.assertLess(time.perf_counter() - start, 3.0)  # bounded, no hang
+            finally:
+                worker.shutdown()
 
     def test_shutdown_clears_and_kills(self):
         sm.prewarm_html_worker()
@@ -978,14 +995,18 @@ class TestWarmHtmlWorker(unittest.TestCase):
 
     def test_runaway_worker_is_cpu_capped(self):
         # If sm is hard-killed mid-parse, the orphaned worker has no parent to time it out — the
-        # worker's self-imposed RLIMIT_CPU is the backstop. Build a 1s-cap worker, feed it the
-        # O(n^2) poison with NO wall-clock kill, and confirm the kernel reaps it in seconds.
+        # worker's self-imposed RLIMIT_CPU is the backstop. The O(n^2) html.parser poison that
+        # used to demonstrate a runaway parse was fixed upstream (CVE-2025-6069), so burn CPU
+        # explicitly instead: keep the worker's real rlimit prologue, swap the parse stage for
+        # a busy loop with NO wall-clock kill, and confirm the kernel reaps it in seconds.
         self.assertIn("RLIMIT_CPU", sm._HTML_WORKER_SRC)  # the production worker carries the cap
-        src = sm._build_html_worker_src(1)
+        prologue = sm._build_html_worker_src(1).split("from html.parser")[0]
+        self.assertIn("setrlimit", prologue)  # the split kept the code under test
+        src = prologue + "while True:\n    pass\n"
         start = time.perf_counter()
         proc = subprocess.run(
             [sys.executable, "-c", src],
-            input="a<" * 400000,
+            input="",
             capture_output=True,
             text=True,
             timeout=20,
@@ -1377,6 +1398,18 @@ class TestBuildEmailMessage(unittest.TestCase):
         with self.assertRaises(SMException) as cm:
             build_email_message("me@x", ["a@b.c"], "s", "b", ["/no/such/file.bin"])
         self.assertIn("Error attaching file", str(cm.exception))
+
+    def test_attachment_filename_with_quotes_and_spaces_round_trips(self):
+        # filename is a header *parameter*, so a name containing the quoting characters
+        # themselves must survive serialize→parse intact — interpolating it into the raw
+        # header value (the old f-string) truncated at the space and broke on quotes.
+        name = 'we"ird na me.bin'
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / name
+            f.write_bytes(b"payload")
+            msg = build_email_message("me@x", ["a@b.c"], "s", "b", [str(f)])
+        atts = list_attachments(message_from_bytes(msg.as_bytes()))
+        self.assertEqual(atts, [(name, b"payload")])
 
     def test_cc_header_set_when_provided(self):
         msg = build_email_message("me@x", ["a@b.c"], "s", "b", cc=["x@y.z", "w@v.u"])
@@ -3891,6 +3924,22 @@ class TestCorruptedIndex(unittest.TestCase):
             with Store(store_path):
                 pass
         self.assertIn("corrupted", str(cm.exception).lower())
+
+
+class TestReadmeHelpSync(unittest.TestCase):
+    """The README's ## Help code block must be byte-identical to what sm actually prints
+    (usage() with no highlighting). Change the usage text, update the README in the same
+    change — this test is the enforcement, per the collection-wide house style."""
+
+    def test_readme_help_block_matches_usage_output(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            sm.usage()
+        printed = _strip_ansi(buf.getvalue()).strip("\n")
+        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+        match = re.search(r"## Help\n```\n(.*?)\n```", readme, re.DOTALL)
+        self.assertIsNotNone(match, "README.md has no ## Help fenced code block")
+        self.assertEqual(match.group(1), printed)
 
 
 if __name__ == "__main__":

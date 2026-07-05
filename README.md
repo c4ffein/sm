@@ -17,20 +17,24 @@ sm - Simple Mail client
     "imap_ssl_port": 993
     "username": "XX"
     "password": "XX"
+    "sender_name": "Jane Doe"  (optional, From: display name for send)
     "pinned_imap_certificate_sha256": "XX"
     "smtp_ssl_host": "XX"
     "smtp_ssl_port": 587
     "pinned_smtp_certificate_sha256": "XX"
     "local_store_path": "XX"
     "ssl_cafile": "/optional/override"  (overrides global)
+    "folder_presets": {"business": ["Work", "Projects"], "personal": ["INBOX"]}  (optional, for read UI)
 ───────────────────────
 - sm send recipient=a@b.com [recipient=...] [cc=...] (subject=title|subject-answer=orig)
       (body=text|body-file=path) [account=name] [file=path] [in-reply-to=<id>] [references="<id1> <id2>"]
-      ──➤ subject-answer= prepends "Re: " idempotently; body-file= reads UTF-8 from path
+      ──➤ subject-answer= prepends 'Re: ' idempotently; body-file= reads UTF-8 from path
 - sm send-patches recipient=a@b.com [recipient=...] patch=0001.patch [patch=...] [account=name] [dry-run]
     ──➤ send git format-patch files inline + threaded (kernel-style); dry-run prints, sends nothing
+    ──➤ In-Reply-To/References in the first patch (format-patch --in-reply-to) join that existing thread
 - sm sync [account=name] [yes] [verbose=0|1|2]      ──➤ fetch new + review deletions/moves
-- sm read [account=name]                            ──➤ read emails in terminal
+- sm read [account=name]                             ──➤ read emails in terminal
+- sm resync-internaldate [account=name]              ──➤ backfill missing INTERNALDATE (no body fetch)
 ───────────────────────
   verbose= accepts 0/1/2 or error/info/debug (applies to all commands)
 You need to generate an app specific password for gmail or other mail clients

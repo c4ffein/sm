@@ -463,7 +463,11 @@ class Store:
                 f"Failed to acquire lock.\nIf no instance of the tool is running, you may remove: {LOCK_PATH}"
             ) from None
         try:
-            self.mails_path.mkdir(mode=0o700, parents=True, exist_ok=True)
+            # 0o700 on the store root too, not just mails/: index.json and state.json hold
+            # subjects/senders/message-ids. mkdir(mode=...) only applies to the leaf, so the
+            # root needs its own call. Pre-existing directories keep their permissions.
+            self.store_path.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self.mails_path.mkdir(mode=0o700, exist_ok=True)
             data = self._load_index_file(self.store_path)
             self.messages = data.get("messages", {})
             self.folder_states = data.get("folders", {})
@@ -1409,7 +1413,10 @@ def build_email_message(
                     part.set_payload(attachment.read())
                 encoders.encode_base64(part)
                 filename = Path(file_path).name
-                part.add_header("Content-Disposition", f"attachment; filename= {filename}")
+                # filename goes in as a *parameter*, never interpolated into the header value:
+                # add_header quotes it (and RFC 2231-encodes non-ASCII), so quotes/spaces/odd
+                # bytes in an on-disk name can't terminate the parameter or inject into the header.
+                part.add_header("Content-Disposition", "attachment", filename=filename)
                 message.attach(part)
             except Exception as e:
                 raise SMException(f"Error attaching file {file_path}: {str(e)}") from e
