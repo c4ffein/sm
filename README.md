@@ -32,6 +32,7 @@ sm - Simple Mail client
 - sm send-patches recipient=a@b.com [recipient=...] patch=0001.patch [patch=...] [account=name] [dry-run]
     ──➤ send git format-patch files inline + threaded (kernel-style); dry-run prints, sends nothing
     ──➤ In-Reply-To/References in the first patch (format-patch --in-reply-to) join that existing thread
+    ──➤ 'sm send-patches help' prints the patch workflow reminders (RFC/v1 → review replies → v2 respin)
 - sm sync [account=name] [yes] [verbose=0|1|2]      ──➤ fetch new + review deletions/moves
 - sm read [account=name]                             ──➤ read emails in terminal
 - sm resync-internaldate [account=name]              ──➤ backfill missing INTERNALDATE (no body fetch)

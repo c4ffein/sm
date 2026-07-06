@@ -2,7 +2,9 @@
 
 import hashlib
 import io
+import os
 import re
+import shlex
 import signal
 import socketserver
 import ssl
@@ -33,6 +35,9 @@ from sm import (
     _is_safe_folder_name,
     build_email_message,
     build_patch_message,
+    build_reply_command,
+    build_reply_headers,
+    build_reply_quote,
     consume_args,
     decode_modified_utf7,
     internaldate_key,
@@ -43,10 +48,12 @@ from sm import (
     parse_authentication_results,
     parse_format_patch,
     parse_list_response,
+    prepare_reply,
     safe_str,
     save_attachment_bytes,
     send_email,
     send_patch_series,
+    send_patches_help,
 )
 
 _ANSI_CSI = re.compile(r"\x1b\[[\d;?]*[a-zA-Z]")
@@ -3924,6 +3931,177 @@ class TestCorruptedIndex(unittest.TestCase):
             with Store(store_path):
                 pass
         self.assertIn("corrupted", str(cm.exception).lower())
+
+
+class TestReplyHelpers(unittest.TestCase):
+    """[r] in the read UI derives a ready-to-run `sm send` command from the opened message —
+    reply-all recipients, RFC 5322 threading headers — plus a '> '-quoted body skeleton."""
+
+    ME = "me@example.com"
+    ACCOUNT = MailConnectionInfos(name="acc", username="me@example.com")
+
+    @staticmethod
+    def _review_mail(extra_headers=b""):
+        return message_from_bytes(
+            b"From: Ann Author <ann@dev.org>\r\n"
+            b"To: Maint <maint@list.org>, me@example.com\r\n"
+            b"Cc: cc1@x.org\r\n"
+            b"Date: Mon, 1 Jun 2026 10:00:00 +0000\r\n"
+            b"Subject: [PATCH v1] fix foo\r\n"
+            b"Message-ID: <v1-1@dev.org>\r\n"
+            b"References: <root@dev.org>\r\n" + extra_headers + b"Content-Type: text/plain\r\n"
+            b"\r\n"
+            b"line one\r\n"
+            b"\r\n"
+            b"line two\r\n"
+        )
+
+    def test_reply_all_addressing_excludes_self(self):
+        to, cc, subject, in_reply_to, references = build_reply_headers(self._review_mail(), self.ME)
+        self.assertEqual(to, ["ann@dev.org"])
+        self.assertEqual(cc, ["maint@list.org", "cc1@x.org"])  # original order, self dropped
+        self.assertEqual(subject, "[PATCH v1] fix foo")
+        self.assertEqual(in_reply_to, "<v1-1@dev.org>")
+        self.assertEqual(references, "<root@dev.org> <v1-1@dev.org>")  # their chain + their id
+
+    def test_reply_to_preferred_over_from(self):
+        msg = self._review_mail(b"Reply-To: list-only@list.org\r\n")
+        to, cc, *_ = build_reply_headers(msg, self.ME)
+        self.assertEqual(to, ["list-only@list.org"])
+        self.assertEqual(cc, ["maint@list.org", "cc1@x.org"])  # Reply-To replaces From entirely
+
+    def test_no_references_falls_back_to_their_message_id(self):
+        msg = message_from_bytes(b"From: a@b.c\r\nMessage-ID: <only@b.c>\r\n\r\nx")
+        *_, in_reply_to, references = build_reply_headers(msg, self.ME)
+        self.assertEqual(in_reply_to, "<only@b.c>")
+        self.assertEqual(references, "<only@b.c>")
+
+    def test_replying_to_own_mail_promotes_first_original_recipient(self):
+        msg = message_from_bytes(b"From: me@example.com\r\nTo: maint@list.org, cc1@x.org\r\n\r\nx")
+        to, cc, *_ = build_reply_headers(msg, self.ME)
+        self.assertEqual(to, ["maint@list.org"])
+        self.assertEqual(cc, ["cc1@x.org"])
+
+    def test_command_round_trips_through_shell_splitting(self):
+        cmd = build_reply_command(self._review_mail(), self.ACCOUNT, "sm-reply-x.txt")
+        tokens = shlex.split(cmd)
+        self.assertEqual(tokens[:2], ["sm", "send"])
+        self.assertIn("account=acc", tokens)
+        self.assertIn("recipient=ann@dev.org", tokens)
+        self.assertIn("cc=maint@list.org", tokens)
+        self.assertIn("cc=cc1@x.org", tokens)
+        self.assertIn("subject-answer=[PATCH v1] fix foo", tokens)
+        self.assertIn("in-reply-to=<v1-1@dev.org>", tokens)
+        self.assertIn("references=<root@dev.org> <v1-1@dev.org>", tokens)
+        self.assertIn("body-file=sm-reply-x.txt", tokens)
+
+    def test_command_is_accepted_by_sms_own_arg_parser(self):
+        # End-to-end: the printed command, split like a shell would, must parse as a valid
+        # `sm send` — including subject-answer's Re: prepend and the references default logic.
+        with tempfile.TemporaryDirectory() as d:
+            body_file = str(Path(d) / "sm-reply-x.txt")
+            body_file_content = "On Mon, Ann wrote:\n> line one\n"
+            Path(body_file).write_text(body_file_content, encoding="utf-8")
+            cmd = build_reply_command(self._review_mail(), self.ACCOUNT, body_file)
+            args, _ = consume_args(shlex.split(cmd))
+        self.assertEqual(args["action"], "send")
+        self.assertEqual(args["recipients"], ["ann@dev.org"])
+        self.assertEqual(args["cc"], ["maint@list.org", "cc1@x.org"])
+        self.assertEqual(args["subject"], "Re: [PATCH v1] fix foo")
+        self.assertEqual(args["body"], body_file_content)
+        self.assertEqual(args["in_reply_to"], "<v1-1@dev.org>")
+        self.assertEqual(args["references"], "<root@dev.org> <v1-1@dev.org>")
+        self.assertEqual(args["account"], "acc")
+
+    def test_command_none_when_no_recipient_derivable(self):
+        msg = message_from_bytes(b"From: me@example.com\r\nSubject: note to self\r\n\r\nx")
+        self.assertIsNone(build_reply_command(msg, self.ACCOUNT, "f.txt"))
+
+    def test_hostile_address_is_refused_not_replaced(self):
+        # Machine-parsed tokens are allowlist-validated and REFUSED on violation — a safe_str
+        # replacement would silently alter who the reply goes to. Quoted-string local parts
+        # ("we ird"@x.org) are legal-but-exotic and land in the same refusal, by design.
+        msg = message_from_bytes(b'From: "we ird"@x.org\r\n\r\nx')
+        with self.assertRaises(SMException) as cm:
+            build_reply_headers(msg, self.ME)
+        self.assertIn("From address", str(cm.exception))
+        self.assertIn("unexpected characters", str(cm.exception))
+
+    def test_hostile_message_id_is_refused_not_replaced(self):
+        msg = message_from_bytes(b'From: a@b.c\r\nMessage-ID: <inject"ed@x>\r\n\r\nx')
+        with self.assertRaises(SMException) as cm:
+            build_reply_headers(msg, self.ME)
+        self.assertIn("Message-ID", str(cm.exception))
+
+    def test_prepare_reply_records_allowlist_refusal(self):
+        ctx = Context()
+        msg = message_from_bytes(b'From: "we ird"@x.org\r\n\r\nx')
+        self.assertIsNone(prepare_reply("abcdef1234567890", msg, self.ACCOUNT, ctx))
+        self.assertEqual(ctx.errors[0].kind, "reply_failed")
+        self.assertIn("unexpected characters", ctx.errors[0].detail)
+
+    def test_hostile_subject_is_shell_quoted_and_terminal_safe(self):
+        msg = message_from_bytes(b"From: a@b.c\r\nSubject: pwn'; rm -rf \x1b[31m$(x)\r\n\r\nx")
+        cmd = build_reply_command(msg, self.ACCOUNT, "f.txt")
+        subject_token = next(t for t in shlex.split(cmd) if t.startswith("subject-answer="))
+        self.assertIn("pwn'; rm -rf", subject_token)  # quoting survives the single quote
+        self.assertNotIn("\x1b", cmd)  # ESC replaced by safe_str, no terminal injection
+
+    def test_quote_attribution_and_prefixes(self):
+        quote = build_reply_quote(self._review_mail())
+        self.assertEqual(
+            quote,
+            "On Mon, 1 Jun 2026 10:00:00 +0000, Ann Author <ann@dev.org> wrote:\n" "> line one\n" ">\n" "> line two\n",
+        )
+
+    def test_prepare_reply_writes_skeleton_and_never_overwrites_a_draft(self):
+        ctx = Context()
+        content_hash = "abcdef1234567890"
+        old_cwd = Path.cwd()
+        with tempfile.TemporaryDirectory() as d:
+            os.chdir(d)
+            try:
+                out = prepare_reply(content_hash, self._review_mail(), self.ACCOUNT, ctx)
+                draft = Path(d) / "sm-reply-abcdef123456.txt"
+                self.assertIn("written", out)
+                self.assertIn("> line one", draft.read_text(encoding="utf-8"))
+                draft.write_text("my edited draft", encoding="utf-8")
+                out2 = prepare_reply(content_hash, self._review_mail(), self.ACCOUNT, ctx)
+                self.assertIn("Kept existing draft", out2)
+                self.assertEqual(draft.read_text(encoding="utf-8"), "my edited draft")
+                for block in (out, out2):  # both end with the same ready-to-run command
+                    self.assertIn("recipient=ann@dev.org", block)
+                    self.assertIn(f"body-file={draft.name}", block)
+            finally:
+                os.chdir(old_cwd)
+        self.assertEqual(ctx.errors, [])
+
+    def test_prepare_reply_records_error_when_unbuildable(self):
+        ctx = Context()
+        msg = message_from_bytes(b"From: me@example.com\r\n\r\nx")
+        self.assertIsNone(prepare_reply("abcdef1234567890", msg, self.ACCOUNT, ctx))
+        self.assertEqual(len(ctx.errors), 1)
+        self.assertEqual(ctx.errors[0].kind, "reply_failed")
+
+
+class TestSendPatchesHelp(unittest.TestCase):
+    def test_bare_help_parses_to_its_own_action(self):
+        args, _ = consume_args(["sm", "send-patches", "help"])
+        self.assertEqual(args, {"action": "send-patches-help"})
+
+    def test_help_mixed_with_real_options_stays_invalid(self):
+        with self.assertRaises(SMException):
+            consume_args(["sm", "send-patches", "help", "recipient=a@b.c"])
+
+    def test_output_fits_120_columns_and_covers_the_lifecycle(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            send_patches_help()
+        lines = buf.getvalue().splitlines()
+        self.assertTrue(all(len(line) <= 120 for line in lines), [line for line in lines if len(line) > 120])
+        text = buf.getvalue()
+        for needle in ("RFC", "v1", "dry-run", "v2", "NEW thread", "press r", "--in-reply-to"):
+            self.assertIn(needle, text)
 
 
 class TestReadmeHelpSync(unittest.TestCase):

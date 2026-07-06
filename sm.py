@@ -16,6 +16,7 @@ import atexit
 import base64
 import os
 import re
+import shlex
 import subprocess
 import sys
 from collections import namedtuple
@@ -29,7 +30,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.policy import SMTP as SMTP_POLICY
 from email.policy import default as DEFAULT_POLICY
-from email.utils import formataddr, make_msgid, parsedate_to_datetime
+from email.utils import formataddr, getaddresses, make_msgid, parsedate_to_datetime
 from enum import Enum
 from hashlib import sha256
 from imaplib import IMAP4_SSL
@@ -1485,6 +1486,129 @@ def send_email(
             pass
 
 
+# ─── reply skeleton (read UI's [r] action) ──────────────────────────
+#
+# Replying stays a plain `sm send` invocation: the read UI only *derives* the
+# correct arguments from the opened message and hands them back as a ready-to-run,
+# shell-quoted command line (plus a "> "-quoted body skeleton on disk). Threading
+# in other people's clients comes from In-Reply-To/References; readability comes
+# from the quoted body they can answer under, kernel-style.
+
+
+# RFC 5322 dot-atom charset (+ @) — what a sane addr-spec or message-id is made of. Reply
+# addresses and ids are machine-parsed downstream (shell, SMTP RCPT TO, other MUAs'
+# threading): a char outside the allowlist is refused loudly rather than replaced, because
+# a silently altered address or id changes who receives the mail / where the thread lands.
+# Human-readable text (subject, quoted body) keeps the safe_str replacement policy instead —
+# free text can't be allowlisted without destroying legitimate content, and a visible U+FFFD
+# in a subject is honest. Exotic-but-legal forms (quoted-string local parts like "a b"@x)
+# are refused too: KISS, reply to those by hand.
+_REPLY_ADDR_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.!#$%&'*+-/=?^_`{|}~@")
+_REPLY_MSGID_CHARS = _REPLY_ADDR_CHARS | frozenset("<> ")  # References = space-separated <id@host> list
+
+
+def _validated_reply_token(value, allowed, what):
+    if set(value) <= allowed:
+        return value
+    raise SMException(
+        f"cannot build reply: {what} contains unexpected characters: {safe_str(value, allow_newlines=False)!r}"
+    )
+
+
+def build_reply_headers(msg, own_address):
+    """Reply-all addressing + threading headers for a stored message, RFC 5322 style.
+
+    Returns (to, cc, subject, in_reply_to, references): `to` is Reply-To when present,
+    else From (§3.6.2); `cc` is the original To + Cc minus ourselves and the To picks,
+    original order kept, deduped; `references` is their References + their Message-ID
+    (§3.6.4), or just their Message-ID when they carried none. Addresses are bare
+    addr-specs — send_email reuses recipient strings as SMTP envelope recipients,
+    where a display-name form would break RCPT TO. Addresses and ids are allowlist-
+    validated; SMException on refusal (see _REPLY_ADDR_CHARS above)."""
+    own = (own_address or "").lower()
+
+    def _unfold(name):
+        if msg[name] is None:
+            return None
+        return _validated_reply_token(" ".join(str(msg[name]).split()), _REPLY_MSGID_CHARS, name)
+
+    def _addrs(*names):
+        out = []
+        for name in names:
+            for _, addr in getaddresses(msg.get_all(name) or []):
+                if addr and addr.lower() != own and addr.lower() not in (a.lower() for a in out):
+                    out.append(_validated_reply_token(addr, _REPLY_ADDR_CHARS, f"{name} address"))
+        return out
+
+    to = _addrs("Reply-To") or _addrs("From")
+    cc = [a for a in _addrs("To", "Cc") if a.lower() not in {t.lower() for t in to}]
+    if not to and cc:  # e.g. replying to our own synced mail: promote the first original recipient
+        to, cc = cc[:1], cc[1:]
+    in_reply_to = _unfold("Message-ID")
+    references = _unfold("References")
+    references = f"{references} {in_reply_to}" if references and in_reply_to else (references or in_reply_to)
+    return to, cc, decoded_header(msg, "Subject"), in_reply_to, references
+
+
+def build_reply_command(msg, account, body_file):
+    """The ready-to-run `sm send` line answering `msg`, one shell-quoted token per argument.
+    Returns None when no recipient can be derived; propagates build_reply_headers'
+    SMException on allowlist refusal. Belt and braces on top of that validation:
+    safe_str() guards the terminal (subject stays attacker-controlled free text);
+    shlex.quote() guards the shell."""
+    to, cc, subject, in_reply_to, references = build_reply_headers(msg, account.username)
+    if not to:
+        return None
+    parts = ["sm", "send"]
+    if account.name:
+        parts.append(f"account={account.name}")
+    parts.extend(f"recipient={a}" for a in to)
+    parts.extend(f"cc={a}" for a in cc)
+    parts.append(f"subject-answer={subject}")
+    if in_reply_to:
+        parts.append(f"in-reply-to={in_reply_to}")
+    if references:
+        parts.append(f"references={references}")
+    parts.append(f"body-file={body_file}")
+    return " ".join(shlex.quote(safe_str(p, allow_newlines=False)) for p in parts)
+
+
+def build_reply_quote(msg):
+    """Quoted-reply body skeleton: attribution line + the message text '> '-prefixed,
+    ready for in-line answers under the relevant quoted lines (kernel-style)."""
+    sender = safe_str(decoded_header(msg, "From"), allow_newlines=False)
+    date = safe_str(decoded_header(msg, "Date"), allow_newlines=False)
+    text = safe_str(kiss_extract_text_from_msg(msg))
+    quoted = "\n".join(("> " + line).rstrip() for line in text.splitlines())
+    return f"On {date}, {sender} wrote:\n{quoted}\n"
+
+
+def prepare_reply(content_hash, msg, account, ctx):
+    """Write the reply body skeleton into the CWD and return the text block the read UI
+    prints after teardown (the note + ready-to-run command). An existing skeleton is a
+    draft the user may have edited — never overwritten (open "x"). Returns None (error
+    recorded on ctx) when the reply can't be built or the skeleton can't be written."""
+    body_file = f"sm-reply-{content_hash[:12]}.txt"
+    try:
+        command = build_reply_command(msg, account, body_file)
+    except SMException as exc:  # allowlist refusal (hostile/exotic address or message-id)
+        ctx.record_error("reply_failed", f"{exc} (message {content_hash[:12]})")
+        return None
+    if command is None:
+        ctx.record_error("reply_failed", f"no reply recipient derivable for {content_hash[:12]}")
+        return None
+    try:
+        with Path(body_file).open("x", encoding="utf-8") as f:
+            f.write(build_reply_quote(msg))
+        note = f"Reply skeleton written to {body_file} — edit it, then run:"
+    except FileExistsError:
+        note = f"Kept existing draft {body_file} — edit it, then run:"
+    except OSError as exc:
+        ctx.record_error("reply_failed", f"cannot write {body_file}: {exc}")
+        return None
+    return f"{note}\n\n{command}"
+
+
 # ─── patch-series sending (git send-email-style) ───────────────────
 #
 # A git format-patch file is already an RFC822 message: an mbox "From " separator
@@ -2394,11 +2518,15 @@ def _read_emails_ui(account, snapshot, ctx):
     )
 
     print(_HIDE_CURSOR, end="")
+    result = None
     try:
-        _run_read_loop(account, snapshot, ctx, state, all_entries)
+        result = _run_read_loop(account, snapshot, ctx, state, all_entries)
     finally:
         # Restore cursor + clear screen so the shell prompt comes back on a clean canvas.
         print(_SHOW_CURSOR + _CLEAR_SCREEN, end="")
+    if result is not None and result[0] == "reply":
+        # Printed after the teardown clear so it survives on the terminal for copy-paste.
+        print(result[1])
 
 
 def _term_size():
@@ -2659,14 +2787,19 @@ def _run_read_loop(account, snapshot, ctx, state, all_entries):
                     continue
                 state.cursor = idx
             content_hash, entry = entries[state.cursor]
-            if _view_email_ui(content_hash, entry, snapshot, ctx, term_width) == "quit":
-                return
+            result = _view_email_ui(content_hash, entry, snapshot, ctx, account, term_width)
+            if result == "quit":
+                return None
+            if isinstance(result, tuple):  # ('reply', text) — unwind so the caller prints after teardown
+                return result
         elif key == "e" and ctx.errors:
             _show_errors_screen(ctx, term_width)
 
 
-def _view_email_ui(content_hash, entry, snapshot, ctx, term_width):
-    """Display one email body. Returns 'back' or 'quit' to the caller."""
+def _view_email_ui(content_hash, entry, snapshot, ctx, account, term_width):
+    """Display one email body. Returns 'back' or 'quit' to the caller, or a
+    ('reply', text) tuple — the read loop unwinds and prints `text` (the reply
+    skeleton note + command) after the UI teardown clears the screen."""
     loaded = _load_message_for_display(content_hash, snapshot.mails_path, ctx)
     if loaded is None:
         print(_CLEAR_SCREEN, end="")
@@ -2682,6 +2815,9 @@ def _view_email_ui(content_hash, entry, snapshot, ctx, term_width):
         print(f"  From:    {safe_str(entry.get('from', ''), allow_newlines=False)}")
         print(f"  Date:    {format_date(entry.get('date', ''))}")
         print(f"  Subject: {safe_str(entry.get('subject', ''), allow_newlines=False)}")
+        message_id = " ".join(str(msg["Message-ID"]).split()) if msg["Message-ID"] is not None else ""
+        if message_id:  # the id git format-patch --in-reply-to / sm send in-reply-to= want
+            print(f"  Id:      {safe_str(message_id, allow_newlines=False)}")
         auth_line = _format_auth_results(parse_authentication_results(msg))
         if auth_line:
             print(f"  Auth:    {auth_line}")
@@ -2693,7 +2829,7 @@ def _view_email_ui(content_hash, entry, snapshot, ctx, term_width):
             for n, (name, content) in enumerate(attachments, 1):
                 print(f"    {n}. {safe_str(name, allow_newlines=False)} ({_human_size(len(content))})")
             print(f"{'═' * term_width}")
-        actions = "  b back  q quit"
+        actions = "  b back  q quit  r reply"
         if attachments:
             actions += "  s save attachment"
         print(actions, end="", flush=True)
@@ -2703,8 +2839,45 @@ def _view_email_ui(content_hash, entry, snapshot, ctx, term_width):
             return "quit"
         if key in ("b", "\x1b"):
             return "back"
+        if key == "r":
+            reply = prepare_reply(content_hash, msg, account, ctx)
+            if reply is not None:
+                return ("reply", reply)
+            # failure recorded on ctx; redraw so the user can inspect via [e] in the list view
         if key == "s" and attachments:
             _save_attachment_action(attachments)
+
+
+# `sm send-patches help` output — reminders for the whole submission lifecycle, ≤120-column lines.
+_SEND_PATCHES_HELP = (
+    "sm send-patches — patch workflow reminders",
+    "──────────────────────────────────────────",
+    "RFC (a.k.a. v0) — asking for early design feedback, nothing is expected to be merged:",
+    "  git format-patch --subject-prefix='RFC PATCH' --cover-letter -o /tmp/patches origin/main..",
+    "  Say in the cover letter what you are unsure about; expect discussion, not application.",
+    "",
+    "v1 — first real submission:",
+    "  git format-patch -o /tmp/patches origin/main..          (--cover-letter recommended for a series)",
+    "  sm send-patches recipient=maintainer@x recipient=list@x patch=/tmp/patches/0001-xx.patch [patch=...] dry-run",
+    "  Check the dry-run output (threading, From:, subjects), then rerun without dry-run.",
+    "",
+    "review discussion — reply IN the existing thread, as regular emails:",
+    "  sm sync, then sm read → open the reviewer's mail → press r → edit the quoted skeleton → run the printed",
+    "  sm send command. Answer every comment in-line under the quoted lines. Do not attach or paste a fixed",
+    "  patch inside a reply — fixes go into the next version of the series.",
+    "",
+    "v2, v3, ... — respin the WHOLE series as a NEW thread:",
+    "  git format-patch -v2 -o /tmp/patches origin/main..",
+    "  Note what changed since v1 below the '---' line of each patch (or in the cover letter), and link the",
+    "  previous discussion (archive URL, or its Message-ID — shown as Id: in sm read's message view).",
+    "  Only use format-patch --in-reply-to='<v1-message-id>' when the maintainer explicitly prefers chained",
+    "  versions — by default send a fresh thread; a new version buried in the old thread is easy to miss.",
+)
+
+
+def send_patches_help():
+    """Unconditional print: the reminders ARE the command's output, not logging."""
+    print("\n".join(_SEND_PATCHES_HELP))
 
 
 def usage(wrong_config=False, wrong_command=False):
@@ -2735,6 +2908,7 @@ def usage(wrong_config=False, wrong_command=False):
         "- sm send-patches recipient=a@b.com [recipient=...] patch=0001.patch [patch=...] [account=name] [dry-run]",
         "    ──➤ send git format-patch files inline + threaded (kernel-style); dry-run prints, sends nothing",
         "    ──➤ In-Reply-To/References in the first patch (format-patch --in-reply-to) join that existing thread",
+        "    ──➤ 'sm send-patches help' prints the patch workflow reminders (RFC/v1 → review replies → v2 respin)",
         "- sm sync [account=name] [yes] [verbose=0|1|2]      ──➤ fetch new + review deletions/moves",
         "- sm read [account=name]                             ──➤ read emails in terminal",
         "- sm resync-internaldate [account=name]              ──➤ backfill missing INTERNALDATE (no body fetch)",
@@ -2780,6 +2954,8 @@ def consume_args(argv):
             raise SMException(f"Invalid options for resync-internaldate: {'  ;  '.join(invalid)}")
         return {"action": "resync-internaldate", "account": account}, ctx
     if argv[1] == "send-patches":
+        if remaining == ["help"]:  # bare `sm send-patches help`; help mixed with real options stays invalid
+            return {"action": "send-patches-help"}, ctx
         allowed_opts = ["recipient", "patch", "account", "dry-run"]
         invalid = [v for v in remaining if all(not v.startswith(f"{o}=") for o in allowed_opts) and v != "dry-run"]
         if invalid:
@@ -2903,6 +3079,8 @@ def main():
             in_reply_to=args["in_reply_to"],
             references=args["references"],
         )
+    elif args["action"] == "send-patches-help":
+        send_patches_help()
     elif args["action"] == "send-patches":
         account_name = args["account"] or config.get("default_account_for_send")
         if not account_name:
